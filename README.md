@@ -11,6 +11,7 @@ they already have.
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
+- `/codex:ask` to get a read-only second opinion from Codex on the question you are discussing
 - `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
 
 ## Requirements
@@ -122,6 +123,26 @@ Examples:
 ```
 
 This command is read-only. It does not fix code.
+
+### `/codex:ask`
+
+Gets a **second opinion** from Codex on the question you are discussing with Claude, and has Claude engage with it.
+
+Claude writes the prompt: a short summary of the current decision point and what it favors, your question verbatim, and pointers to the relevant files. Codex reads the repository itself, read-only, and answers. Claude then states Codex's position, says where it agrees and disagrees, and what it now recommends, instead of pasting the raw answer.
+
+Each Claude Code session is linked to one Codex thread, so follow-up asks continue the same Codex conversation, also after `claude --resume`. `--fresh` starts a new Codex thread, which becomes the linked one.
+
+It supports `--fresh`, `--model`, and `--effort`. It always runs in the foreground.
+
+Examples:
+
+```bash
+/codex:ask should the retry policy live in the client or in the job runner?
+/codex:ask --effort high is the proposed event schema in docs/prd.md missing anything for replay?
+/codex:ask --fresh what would you change about the module boundaries in src/billing?
+```
+
+This command is read-only. It never lets Codex write to the repository.
 
 ### `/codex:rescue`
 
@@ -243,6 +264,12 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 
 ```bash
 /codex:review
+```
+
+### Get A Second Opinion While Discussing
+
+```bash
+/codex:ask which of the two caching options we just discussed would you pick, and why?
 ```
 
 ### Hand A Problem To Codex

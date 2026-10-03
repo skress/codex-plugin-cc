@@ -70,10 +70,36 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /can still take extra focus text after the flags/i);
 });
 
+test("ask command consults Codex read-only in the linked thread and engages with the answer", () => {
+  const ask = read("commands/ask.md");
+  const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+
+  assert.match(ask, /argument-hint:\s*"\[--fresh\] \[--model <model\|spark>\] \[--effort <none\|minimal\|low\|medium\|high\|xhigh>\] <question>"/);
+  assert.match(ask, /allowed-tools:\s*Bash\(node:\*\)\s*$/m);
+  // The prompt travels on stdin, so no temp file and no extra Bash permissions are needed.
+  assert.match(ask, /codex-companion\.mjs" task --resume-last --json <<'CODEX_ASK_PROMPT'/);
+  assert.match(ask, /Omit `--resume-last` when the request includes `--fresh`/i);
+  assert.match(ask, /Never add `--write`/);
+  assert.match(ask, /Never add `--background`/);
+  assert.match(ask, /timeout: 600000/);
+  assert.match(ask, /never paste file contents/i);
+  assert.match(ask, /You have read-only access to this repository; read what you need, cite paths and lines, answer the question directly, and say where you disagree\. Do not propose patches unless asked\./);
+  assert.match(ask, /`errorMessage`/);
+  assert.match(ask, /!codex login/);
+  assert.match(ask, /No retries/i);
+  assert.match(ask, /Engage, don't relay/i);
+  assert.match(ask, /Do not paste Codex's raw output/i);
+  assert.match(ask, /Do not ask whether to continue the Codex thread/i);
+  assert.match(ask, /Do not implement changes/i);
+  assert.match(readme, /### `\/codex:ask`/);
+  assert.match(readme, /\/codex:ask --fresh/);
+});
+
 test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
   assert.deepEqual(commandFiles, [
     "adversarial-review.md",
+    "ask.md",
     "cancel.md",
     "rescue.md",
     "result.md",
