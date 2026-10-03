@@ -5,7 +5,9 @@ allowed-tools: Bash(node:*)
 ---
 
 Get a second opinion from Codex on the question the user is asking right now, then engage with it yourself.
-Codex reads the repository on its own, read-only. Each Claude session is linked to one Codex thread, so follow-up asks (also after `claude --resume`) continue the same Codex conversation.
+Codex reads the repository on its own, read-only. Each Claude session is linked to one Codex thread, so follow-up asks (also after `claude --resume`) continue the same Codex conversation: Codex remembers the earlier asks of this session and its answers.
+
+Always send the question to Codex, even if you think you could answer it yourself. "You" and "your previous answer" in the question refer to Codex.
 
 Raw user request:
 $ARGUMENTS
