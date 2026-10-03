@@ -33,7 +33,7 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
   installFakeCodex(binDir);
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: makeTempDir(),
     env: buildEnv(binDir)
   });
 
@@ -50,7 +50,7 @@ test("setup is ready without npm when Codex is already installed and authenticat
   fs.symlinkSync(process.execPath, path.join(binDir, "node"));
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: makeTempDir(),
     env: {
       ...process.env,
       PATH: binDir
@@ -70,7 +70,7 @@ test("setup trusts app-server API key auth even when login status alone would fa
   installFakeCodex(binDir, "api-key-account-only");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: makeTempDir(),
     env: buildEnv(binDir)
   });
 
@@ -88,7 +88,7 @@ test("setup is ready when the active provider does not require OpenAI login", ()
   installFakeCodex(binDir, "provider-no-auth");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: makeTempDir(),
     env: buildEnv(binDir)
   });
 
@@ -106,7 +106,7 @@ test("setup treats custom providers with app-server-ready config as ready", () =
   installFakeCodex(binDir, "env-key-provider");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: makeTempDir(),
     env: buildEnv(binDir)
   });
 
@@ -124,7 +124,7 @@ test("setup reports not ready when app-server config read fails", () => {
   installFakeCodex(binDir, "config-read-fails");
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
-    cwd: ROOT,
+    cwd: makeTempDir(),
     env: buildEnv(binDir)
   });
 
