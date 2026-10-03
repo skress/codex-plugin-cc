@@ -503,11 +503,10 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
 });
 
-test("task-resume-candidate returns the latest rescue thread from the current session", () => {
+test("task-resume-candidate returns the thread linked to the current session", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
 
   fs.writeFileSync(
     path.join(stateDir, "state.json"),
@@ -515,38 +514,11 @@ test("task-resume-candidate returns the latest rescue thread from the current se
       {
         version: 1,
         config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-current",
-            status: "completed",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-current",
-            threadId: "thr_current",
-            summary: "Investigate the flaky test",
-            updatedAt: "2026-03-24T20:00:00.000Z"
-          },
-          {
-            id: "task-other-session",
-            status: "completed",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Old rescue run",
-            updatedAt: "2026-03-24T20:05:00.000Z"
-          },
-          {
-            id: "review-current",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-current",
-            threadId: "thr_review",
-            summary: "Review main...HEAD",
-            updatedAt: "2026-03-24T20:10:00.000Z"
-          }
-        ]
+        jobs: [],
+        links: {
+          "sess-current": { threadId: "thr_current", updatedAt: new Date().toISOString() },
+          "sess-other": { threadId: "thr_other", updatedAt: new Date().toISOString() }
+        }
       },
       null,
       2
@@ -566,7 +538,6 @@ test("task-resume-candidate returns the latest rescue thread from the current se
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.available, true);
   assert.equal(payload.sessionId, "sess-current");
-  assert.equal(payload.candidate.id, "task-current");
   assert.equal(payload.candidate.threadId, "thr_current");
 });
 
@@ -606,12 +577,11 @@ test("task --resume-last does not resume a task from another Claude session", ()
     cwd: repo,
     env: currentEnv
   });
-  assert.equal(resume.status, 1);
-  assert.match(resume.stderr, /No previous Codex task thread was found for this repository\./);
+  assert.equal(resume.status, 0, resume.stderr);
 
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
-  assert.equal(fakeState.lastTurnStart.prompt, "initial task");
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_2");
+  assert.equal(fakeState.lastTurnStart.prompt, "follow up");
 });
 
 test("task --resume-last ignores running tasks from other Claude sessions", () => {
@@ -665,8 +635,7 @@ test("task --resume-last ignores running tasks from other Claude sessions", () =
     cwd: repo,
     env
   });
-  assert.equal(resume.status, 1);
-  assert.match(resume.stderr, /No previous Codex task thread was found for this repository\./);
+  assert.equal(resume.status, 0, resume.stderr);
 });
 
 test("session start hook exports the Claude session id, transcript path, and plugin data dir", () => {

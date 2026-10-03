@@ -30,10 +30,10 @@ Command selection:
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
-- `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
-- `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
+- Without `--fresh`, use `task --resume-last`, even if the request does not sound like a follow-up. Each Claude session is linked to one Codex thread; `--resume-last` continues it, or starts one if none is linked yet.
+- `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up. The new thread becomes the linked one.
 - `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
-- `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
+- `task --resume-last`: continues the Codex thread linked to this Claude session, including after `claude --resume`.
 
 Safety rules:
 - Default to write-capable Codex work in `codex:codex-rescue` unless the user explicitly asks for read-only behavior.

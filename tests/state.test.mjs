@@ -5,7 +5,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  getSessionLink,
+  loadState,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  saveState,
+  setSessionLink
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +111,47 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("setSessionLink records the thread for a Claude session", () => {
+  const workspace = makeTempDir();
+
+  setSessionLink(workspace, "sess-a", "thr_1");
+  setSessionLink(workspace, "sess-b", "thr_2");
+  setSessionLink(workspace, "sess-a", "thr_3");
+
+  assert.equal(getSessionLink(workspace, "sess-a").threadId, "thr_3");
+  assert.equal(getSessionLink(workspace, "sess-b").threadId, "thr_2");
+  assert.equal(getSessionLink(workspace, "sess-missing"), null);
+});
+
+test("saveState keeps session links when the session's jobs are removed", () => {
+  const workspace = makeTempDir();
+  setSessionLink(workspace, "sess-a", "thr_1");
+
+  const state = loadState(workspace);
+  saveState(workspace, { ...state, jobs: [] });
+
+  assert.equal(getSessionLink(workspace, "sess-a").threadId, "thr_1");
+});
+
+test("saveState drops session links older than 90 days and keeps at most 200", () => {
+  const workspace = makeTempDir();
+  const now = Date.now();
+  const daysAgo = (days) => new Date(now - days * 24 * 60 * 60 * 1000).toISOString();
+  const links = {
+    "sess-stale": { threadId: "thr_stale", updatedAt: daysAgo(91) }
+  };
+  for (let index = 0; index < 201; index += 1) {
+    links[`sess-${index}`] = { threadId: `thr_${index}`, updatedAt: new Date(now - index * 1000).toISOString() };
+  }
+
+  saveState(workspace, { ...loadState(workspace), links });
+
+  const saved = loadState(workspace).links;
+  assert.equal(Object.keys(saved).length, 200);
+  assert.equal(saved["sess-stale"], undefined);
+  assert.equal(saved["sess-200"], undefined);
+  assert.equal(saved["sess-0"].threadId, "thr_0");
+  assert.equal(saved["sess-199"].threadId, "thr_199");
 });
