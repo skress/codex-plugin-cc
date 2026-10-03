@@ -147,11 +147,10 @@ allowed-tools: Bash(node:*)
 
 Body — instructions to Claude, in this order:
 
-1. **Compose the prompt yourself.** Write it to a temp file (`mktemp`) containing: (a) a two-to-four sentence summary of the current decision point and what you currently favor and why; (b) the user's question verbatim; (c) pointers to relevant files (paths, refs, line ranges) — never pasted contents; (d) the fixed closing line: "You have read-only access to this repository; read what you need, cite paths and lines, answer the question directly, and say where you disagree. Do not propose patches unless asked."
-2. **Run** `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --resume-last --json --prompt-file <tmp>`. Omit `--resume-last` when `--fresh` was given. Pass `--model` / `--effort` through only if the user gave them. Never add `--write`. Never `--background`.
+1. **Compose the prompt yourself.** It contains: (a) a two-to-four sentence summary of the current decision point and what you currently favor and why; (b) the user's question verbatim; (c) pointers to relevant files (paths, refs, line ranges) — never pasted contents; (d) the fixed closing line: "You have read-only access to this repository; read what you need, cite paths and lines, answer the question directly, and say where you disagree. Do not propose patches unless asked."
+2. **Run** `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --resume-last --json <<'CODEX_ASK_PROMPT' … CODEX_ASK_PROMPT` with `timeout: 600000`. The prompt goes on stdin as a quoted heredoc (changed 2026-10-03 from `mktemp` + `--prompt-file`: no temp file, no cleanup, no Bash permission beyond `Bash(node:*)`). Omit `--resume-last` when `--fresh` was given. Pass `--model` / `--effort` through only if the user gave them. Never add `--write`. Never `--background`.
 3. **Read the result.** Non-zero exit with no JSON → report the stderr message in one line and stop. `status` ≠ 0 → report `errorMessage` in one line (auth → "run `!codex login`"; rate limit → say so; still running → say a Codex task of this session is still running) and stop. No retries.
 4. **Engage, don't relay.** Quote GPT's position briefly, say where you agree and where you disagree with reasons, and what you now recommend. Don't paste the raw output; don't ask whether to continue the thread (it continues automatically).
-5. Delete the temp file.
 
 Plus a `/codex:ask` section in `README.md` in the style of the others, and `docs/` if commands are listed there.
 
