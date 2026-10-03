@@ -5,6 +5,8 @@ import process from "node:process";
 
 const VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
+// The plugin manifest and the marketplace's plugin entry deliberately carry no version:
+// Claude Code then versions installs by commit SHA, so every merge to main is an update.
 const TARGETS = [
   {
     file: "package.json",
@@ -39,18 +41,6 @@ const TARGETS = [
     ]
   },
   {
-    file: "plugins/codex/.claude-plugin/plugin.json",
-    values: [
-      {
-        label: "version",
-        get: (json) => json.version,
-        set: (json, version) => {
-          json.version = version;
-        }
-      }
-    ]
-  },
-  {
     file: ".claude-plugin/marketplace.json",
     values: [
       {
@@ -59,13 +49,6 @@ const TARGETS = [
         set: (json, version) => {
           requireObject(json.metadata, ".claude-plugin/marketplace.json metadata");
           json.metadata.version = version;
-        }
-      },
-      {
-        label: "plugins[codex].version",
-        get: (json) => findMarketplacePlugin(json).version,
-        set: (json, version) => {
-          findMarketplacePlugin(json).version = version;
         }
       }
     ]
@@ -129,12 +112,6 @@ function requireObject(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`Expected ${label} to be an object.`);
   }
-}
-
-function findMarketplacePlugin(json) {
-  const plugin = json.plugins?.find((entry) => entry?.name === "codex");
-  requireObject(plugin, ".claude-plugin/marketplace.json plugins[codex]");
-  return plugin;
 }
 
 function readJson(root, file) {

@@ -70,7 +70,7 @@ Upstream sync (if upstream ever moves): `git fetch upstream`, update `upstream-m
 
 ### Versions
 
-The `version` fields in `.claude-plugin/marketplace.json` and `plugins/codex/.claude-plugin/plugin.json` on `main` are **semver prerelease on top of the upstream version**: upstream `1.0.6` → fork `1.0.6-fork.1`, next fork change `1.0.6-fork.2`, after merging upstream `1.0.7` → `1.0.7-fork.1`. Four-part versions (`1.0.6.1`) are not semver and may be rejected by the plugin loader (§0.1 confirms). Within the fork's own marketplace, prerelease versions order correctly against each other. Every version on `main` gets a git tag `v1.0.6-fork.1`; the Ansible role pins to tags.
+*Changed 2026-10-03:* installs follow `main`, with no tags and no version bumps. `plugins/codex/.claude-plugin/plugin.json` and the `codex` entry in `.claude-plugin/marketplace.json` carry **no `version`**, so Claude Code versions the plugin by the commit SHA of `plugins/codex/`, and every merge to `main` that touches it is an update. The marketplace has auto-update on. `package.json` and the marketplace `metadata.version` (`1.0.6-fork.3`) remain as informational versions only. The tags `v1.0.6-fork.0` … `fork.3` mark the history before the switch.
 
 ### Marketplace manifest on `main`
 
