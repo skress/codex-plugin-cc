@@ -28,7 +28,7 @@ Don't install `codex@openai-codex` as well: only one plugin named `codex` loads 
 
 ### Updates
 
-There are no release tags or version bumps. Every merge to `main` that changes `plugins/codex/` is an update, because Claude Code versions the plugin by commit SHA.
+There are no release tags or version bumps. Claude Code versions the plugin by commit SHA, so a merge to `main` is picked up as an update.
 
 - **Automatic:** a few minutes after your first message in a session, Claude Code updates in the background and shows `Plugin updated: codex · Run /reload-plugins to apply`. Run `/reload-plugins`, or just start the next session.
 - **Right now:** `/plugin` → **Marketplaces** → `skress-codex` → **Update marketplace**, then `/reload-plugins`.
