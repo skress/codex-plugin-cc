@@ -166,8 +166,8 @@ The skill: runs the review in the foreground; writes the result under `## Codex 
 ## 9. Order of work
 
 1. ✅ §4 setup, install at `v1.0.6-fork.0`, §0 verification (`docs/verification.md`).
-2. `feat/session-link` (§6); tests green; merge into `main`, tag `-fork.1`, update the local install. Manual check: `/codex:rescue --wait` → quit → `claude --resume` → `/codex:rescue --wait continue` → same thread (`codex resume <id>` shows both turns); `--fresh` moves the link.
-3. `feat/ask` (§7); merge, tag `-fork.2`, update. Manual check: `/codex:ask`, quit, `claude --resume`, `/codex:ask` again → one Codex thread; `/codex:ask` after a `--write` rescue in the same session → resumes read-only (write attempt fails).
+2. ✅ `feat/session-link` (§6); tests green; merge into `main`, tag `-fork.1`, update the local install. Manual check: `/codex:rescue --wait` → quit → `claude --resume` → `/codex:rescue --wait continue` → same thread (`codex resume <id>` shows both turns); `--fresh` moves the link.
+3. ✅ `feat/ask` (§7); merge, tag `-fork.2`, update. Manual check: `/codex:ask`, quit, `claude --resume`, `/codex:ask` again → one Codex thread; `/codex:ask` after a `--write` rescue in the same session → resumes read-only (write attempt fails).
 4. Story review loop skill (§8) on one real story.
 5. Ansible tasks; install from the tag on one Linux and one macOS VM; verify §0.6 on a VM with the Claude Code sandbox enabled.
 

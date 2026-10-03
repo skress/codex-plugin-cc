@@ -113,3 +113,18 @@ Headless sessions in a scratch repo, installed plugin at `1.0.6-fork.1`:
 2. Session ended: `SessionEnd` removed the session's jobs (0 left), the link stayed.
 3. `claude -p --resume 09fa748b… "/codex:rescue --wait … what is the secret word?"` → `PELICAN`, same thread.
 4. Same session, `/codex:rescue --fresh --wait … do you know a secret word?` → `No.`, link → new thread `01a101b8-c79f…`.
+
+## `/codex:ask` (`v1.0.6-fork.2` → `fork.3`) manual check — 2026-10-03
+
+Headless sessions (`claude -p --model sonnet --allowedTools "Bash(node:*)"`) in a scratch repo with a retry-placement
+decision (`docs/decision.md`, `src/client.js`, `src/runner.js`):
+1. `/codex:ask … which option given the idempotency constraint?` → Codex read the files and cited lines; Claude stated
+   Codex's position, agreed/disagreed with reasons, recommended, pasted no raw output. Link → thread `01a101da-7369…`.
+   (A `/codex:ask` placed mid-prompt is not a slash command; Claude then tries the Skill tool. Put it first.)
+2. Session ended, `claude --resume`, `/codex:ask … which option did you recommend previously?`
+   - fork.2: Claude answered itself without calling Codex and claimed Codex had no record → fixed in fork.3
+     (`ask.md`: always send the question to Codex; Codex remembers earlier asks).
+   - fork.3: Codex recalled its earlier recommendation and caveat; same thread.
+3. Same session: `/codex:rescue --wait` with a write → continued the same thread, edited `src/client.js`.
+   Then `/codex:ask` with a `touch` probe → "Operation not permitted", no file created; Codex recalled its write.
+   The link stayed on one thread throughout.
