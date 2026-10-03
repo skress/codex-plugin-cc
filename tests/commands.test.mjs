@@ -79,6 +79,8 @@ test("ask command consults Codex read-only in the linked thread and engages with
   // The prompt travels on stdin, so no temp file and no extra Bash permissions are needed.
   assert.match(ask, /codex-companion\.mjs" task --resume-last --json <<'CODEX_ASK_PROMPT'/);
   assert.match(ask, /Omit `--resume-last` when the request includes `--fresh`/i);
+  assert.match(ask, /Always send the question to Codex, even if you think you could answer it yourself/i);
+  assert.match(ask, /Codex remembers the earlier asks of this session and its answers/i);
   assert.match(ask, /Never add `--write`/);
   assert.match(ask, /Never add `--background`/);
   assert.match(ask, /timeout: 600000/);
