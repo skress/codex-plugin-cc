@@ -37,8 +37,7 @@ function makeVersionFixture() {
     }
   });
   writeJson(path.join(root, "plugins", "codex", ".claude-plugin", "plugin.json"), {
-    name: "codex",
-    version: "1.0.2"
+    name: "codex"
   });
   writeJson(path.join(root, ".claude-plugin", "marketplace.json"), {
     metadata: {
@@ -46,8 +45,7 @@ function makeVersionFixture() {
     },
     plugins: [
       {
-        name: "codex",
-        version: "1.0.2"
+        name: "codex"
       }
     ]
   });
@@ -66,9 +64,10 @@ test("bump-version updates every release manifest", () => {
   assert.equal(readJson(path.join(root, "package.json")).version, "1.2.3");
   assert.equal(readJson(path.join(root, "package-lock.json")).version, "1.2.3");
   assert.equal(readJson(path.join(root, "package-lock.json")).packages[""].version, "1.2.3");
-  assert.equal(readJson(path.join(root, "plugins", "codex", ".claude-plugin", "plugin.json")).version, "1.2.3");
   assert.equal(readJson(path.join(root, ".claude-plugin", "marketplace.json")).metadata.version, "1.2.3");
-  assert.equal(readJson(path.join(root, ".claude-plugin", "marketplace.json")).plugins[0].version, "1.2.3");
+  // Plugin-level versions stay unset so installs track commits (see the test below).
+  assert.equal(readJson(path.join(root, "plugins", "codex", ".claude-plugin", "plugin.json")).version, undefined);
+  assert.equal(readJson(path.join(root, ".claude-plugin", "marketplace.json")).plugins[0].version, undefined);
 });
 
 test("bump-version check mode reports stale metadata", () => {
@@ -83,6 +82,16 @@ test("bump-version check mode reports stale metadata", () => {
   });
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /plugins\/codex\/\.claude-plugin\/plugin\.json version/);
   assert.match(result.stderr, /\.claude-plugin\/marketplace\.json metadata\.version/);
+});
+
+test("plugin manifests carry no version so installs track commits on main", () => {
+  // Claude Code uses a manifest or marketplace-entry version as the cache key; without one
+  // it uses the commit SHA of the plugin directory, so every merge to main is an update.
+  const plugin = readJson(path.join(ROOT, "plugins", "codex", ".claude-plugin", "plugin.json"));
+  const marketplace = readJson(path.join(ROOT, ".claude-plugin", "marketplace.json"));
+  const entry = marketplace.plugins.find((candidate) => candidate.name === "codex");
+
+  assert.equal(plugin.version, undefined);
+  assert.equal(entry.version, undefined);
 });

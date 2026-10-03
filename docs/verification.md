@@ -128,3 +128,14 @@ decision (`docs/decision.md`, `src/client.js`, `src/runner.js`):
 3. Same session: `/codex:rescue --wait` with a write → continued the same thread, edited `src/client.js`.
    Then `/codex:ask` with a `touch` probe → "Operation not permitted", no file created; Codex recalled its write.
    The link stayed on one thread throughout.
+
+## Tracking `main` instead of tags — 2026-10-03
+
+Docs: <https://code.claude.com/docs/en/plugins/loading.md> ("How Claude Code computes the version", "When auto-update runs"),
+<https://code.claude.com/docs/en/discover-plugins.md> ("Keep plugins updated").
+- Version resolution: manifest `version`, then the marketplace entry's `version`, else, for a relative-path plugin in a
+  Git-hosted marketplace, "the commit SHA of the installed directory". Both plugin-level versions were removed.
+- Without `#ref`, a GitHub marketplace follows the default branch.
+- Auto-update: off by default for third-party marketplaces; turned on with `autoUpdate` on the `extraKnownMarketplaces`
+  entry (or `/plugin` → Marketplaces → Enable auto-update). It runs in the background some minutes after the first message
+  of an interactive session; the running session keeps its version until `/reload-plugins`.

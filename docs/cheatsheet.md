@@ -12,24 +12,27 @@ brew install codex            # or: npm install -g @openai/codex
 codex login                   # ChatGPT login; --device-auth on headless machines
 ```
 
-Add the marketplace pinned to a release tag, then install the plugin:
+Add the marketplace (it follows the fork's `main` branch) and install the plugin:
 
 ```bash
-claude plugin marketplace add 'skress/codex-plugin-cc#v1.0.6-fork.3'
+claude plugin marketplace add skress/codex-plugin-cc
 claude plugin install codex@skress-codex --scope user
 ```
+
+Turn on auto-update: in Claude Code, `/plugin` → **Marketplaces** → `skress-codex` → **Enable auto-update**.
+Third-party marketplaces have it off by default.
 
 Restart Claude Code, then check readiness with `/codex:setup`.
 
 Don't install `codex@openai-codex` as well: only one plugin named `codex` loads per session.
 
-### Update to a newer tag
+### Updates
 
-The tag is also recorded in `~/.claude/settings.json`, so a plain `plugin update` won't move it:
+There are no release tags or version bumps. Every merge to `main` that changes `plugins/codex/` is an update, because Claude Code versions the plugin by commit SHA.
 
-1. In `~/.claude/settings.json`, set `extraKnownMarketplaces["skress-codex"].source.ref` to the new tag.
-2. `claude plugin marketplace add 'skress/codex-plugin-cc#<new tag>'`
-3. `claude plugin update codex@skress-codex --scope user`, then restart Claude Code.
+- **Automatic:** a few minutes after your first message in a session, Claude Code updates in the background and shows `Plugin updated: codex · Run /reload-plugins to apply`. Run `/reload-plugins`, or just start the next session.
+- **Right now:** `/plugin` → **Marketplaces** → `skress-codex` → **Update marketplace**, then `/reload-plugins`.
+- **From a shell:** `claude plugin marketplace update skress-codex && claude plugin update codex@skress-codex`.
 
 ## The session ↔ thread link
 
