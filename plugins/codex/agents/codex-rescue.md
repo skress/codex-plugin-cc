@@ -33,10 +33,8 @@ Forwarding rules:
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
-- `--resume` means add `--resume-last`.
-- `--fresh` means do not add `--resume-last`.
-- If the user is clearly asking to continue prior Codex work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` is present.
-- Otherwise forward the task as a fresh `task` run.
+- Unless `--fresh` is present, add `--resume-last`. It continues the Codex thread linked to this Claude session, or starts one if none is linked yet.
+- `--fresh` means do not add `--resume-last`; the new thread becomes the linked one.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Return the stdout of the `codex-companion` command exactly as-is.
 - If the Bash call fails or Codex cannot be invoked, return nothing.

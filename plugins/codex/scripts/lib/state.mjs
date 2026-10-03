@@ -11,6 +11,8 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const MAX_SESSION_LINKS = 200;
+const SESSION_LINK_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 
 function nowIso() {
   return new Date().toISOString();
@@ -22,7 +24,8 @@ function defaultState() {
     config: {
       stopReviewGate: false
     },
-    jobs: []
+    jobs: [],
+    links: {}
   };
 }
 
@@ -70,7 +73,8 @@ export function loadState(cwd) {
         ...defaultState().config,
         ...(parsed.config ?? {})
       },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
+      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
+      links: isPlainObject(parsed.links) ? parsed.links : {}
     };
   } catch {
     return defaultState();
@@ -81,6 +85,21 @@ function pruneJobs(jobs) {
   return [...jobs]
     .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
     .slice(0, MAX_JOBS);
+}
+
+function isPlainObject(value) {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+// Session links map a Claude session id to its Codex thread. They outlive the
+// session's jobs so `--resume-last` still finds the thread after `claude --resume`.
+function pruneLinks(links) {
+  const cutoff = Date.now() - SESSION_LINK_MAX_AGE_MS;
+  const entries = Object.entries(isPlainObject(links) ? links : {})
+    .filter(([, link]) => link?.threadId && Date.parse(link.updatedAt ?? "") >= cutoff)
+    .sort(([, left], [, right]) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+    .slice(0, MAX_SESSION_LINKS);
+  return Object.fromEntries(entries);
 }
 
 function removeFileIfExists(filePath) {
@@ -99,7 +118,8 @@ export function saveState(cwd, state) {
       ...defaultState().config,
       ...(state.config ?? {})
     },
-    jobs: nextJobs
+    jobs: nextJobs,
+    links: pruneLinks(state.links)
   };
 
   const retainedIds = new Set(nextJobs.map((job) => job.id));
@@ -148,6 +168,25 @@ export function upsertJob(cwd, jobPatch) {
 
 export function listJobs(cwd) {
   return loadState(cwd).jobs;
+}
+
+export function getSessionLink(cwd, sessionId) {
+  if (!sessionId) {
+    return null;
+  }
+  return loadState(cwd).links[sessionId] ?? null;
+}
+
+export function setSessionLink(cwd, sessionId, threadId) {
+  if (!sessionId || !threadId) {
+    return;
+  }
+  updateState(cwd, (state) => {
+    state.links = {
+      ...state.links,
+      [sessionId]: { threadId, updatedAt: nowIso() }
+    };
+  });
 }
 
 export function setConfig(cwd, key, value) {

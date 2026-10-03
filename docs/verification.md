@@ -89,3 +89,14 @@ write to `~/.codex` and `~/.claude/plugins/data/codex-skress-codex`; the app-ser
   message on stderr.
 - Auth error: not reproducible here (an empty `CODEX_HOME` still authenticated — the app-server reached the existing
   login). Rate limit: not reproducible. Both are expected to surface as a failed turn (status 1) with the server message.
+
+## Side findings — 2026-10-03
+
+- **Test suite leaks broker processes.** Each `npm test` run leaves ~30–40 `app-server-broker.mjs` processes (plus their
+  fake `codex app-server` children) running; tests that start a shared broker never shut it down. Clean up with
+  `ps -eo pid,command | grep "[a]pp-server-broker.mjs serve" | grep codex-plugin-test- | awk '{print $1}' | xargs kill`.
+- **Running the companion outside Claude Code leaves a broker registered for that cwd** (no `SessionEnd` tears it down).
+  In the repo root this flips the `setup` tests to `sessionRuntime: shared` and fails them. Don't smoke-test from the
+  checkout root; use a scratch clone.
+- Codex 0.160.0 runs its own managed app-server daemon (`~/.codex/packages/app-server-daemon`), which likely explains
+  why an empty `CODEX_HOME` still authenticated in §0.7.

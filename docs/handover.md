@@ -124,10 +124,10 @@ State (`lib/state.mjs`):
 
 Runtime (`codex-companion.mjs`):
 
-- **Write the link** as soon as a `task` run knows its thread id (the "thread ready" progress event), foreground and background, when a session id is present. So `--fresh` immediately moves the link, and a failed turn on a valid thread still links it.
+- **Write the link** when a `task` run returns a thread id (foreground and background), when a session id is present. A failed turn on a valid thread still links it. (Writing at "thread ready" instead was dropped: a concurrent resume is refused while a run is active anyway.)
 - **`--resume-last` / `--resume`** resolve the session's link. If a task job of this session is queued/running → error as today (a thread runs one turn at a time). **If there is no link → start a fresh thread instead of erroring.** Without a session id (script run outside Claude Code): upstream fallback (`findLatestTaskThread`), then fresh.
 - `task` without `--resume-last` stays a fresh run (explicit).
-- `--no-link`: neither reads nor writes the link. The stop-gate hook passes it, so gate runs never move the link.
+- `--no-link`: the run doesn't update the link. The stop-gate hook passes it, so gate runs never move the link.
 - `task-resume-candidate --json` reports the linked thread (`available`, `threadId`).
 - `--json` payload gains `errorMessage` (the failure message the runtime already computes; `null` on success) and `resumed` (boolean). Thrown errors stay on stderr with exit 1 and no stdout JSON.
 

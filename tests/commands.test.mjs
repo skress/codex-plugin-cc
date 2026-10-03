@@ -91,7 +91,7 @@ test("rescue command absorbs continue semantics", () => {
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
 
   assert.match(rescue, /The final user-visible response must be Codex's output verbatim/i);
-  assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent/);
+  assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*Agent\s*$/m);
   // Regression for #234: `Skill(codex:rescue)` from the main agent recursed
   // because rescue.md named the routing with ambiguous prose ("Route this
   // request to the `codex:codex-rescue` subagent") while running under
@@ -105,20 +105,18 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /--resume\|--fresh/);
   assert.match(rescue, /--model <model\|spark>/);
   assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
-  assert.match(rescue, /task-resume-candidate --json/);
-  assert.match(rescue, /AskUserQuestion/);
-  assert.match(rescue, /Continue current Codex thread/);
-  assert.match(rescue, /Start a new Codex thread/);
+  // One Claude session is linked to one Codex thread: rescue continues it by default.
+  assert.doesNotMatch(rescue, /task-resume-candidate/);
+  assert.doesNotMatch(rescue, /AskUserQuestion/);
+  assert.match(rescue, /Unless the request includes `--fresh`, add `--resume`/i);
+  assert.match(rescue, /Codex thread linked to this Claude session/i);
   assert.match(rescue, /run the `codex:codex-rescue` subagent in the background/i);
   assert.match(rescue, /default to foreground/i);
   assert.match(rescue, /Do not forward them to `task`/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
   assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
-  assert.match(rescue, /If the request includes `--resume`, do not ask whether to continue/i);
-  assert.match(rescue, /If the request includes `--fresh`, do not ask whether to continue/i);
-  assert.match(rescue, /If the user chooses continue, add `--resume`/i);
-  assert.match(rescue, /If the user chooses a new thread, add `--fresh`/i);
+  assert.match(rescue, /Do not ask whether to continue/i);
   assert.match(rescue, /thin forwarder only/i);
   assert.match(rescue, /Return the Codex companion stdout verbatim to the user/i);
   assert.match(rescue, /Do not paraphrase, summarize, rewrite, or add commentary before or after it/i);
@@ -127,6 +125,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
   assert.match(agent, /thin forwarding wrapper/i);
+  assert.match(agent, /Unless `--fresh` is present, add `--resume-last`/i);
+  assert.doesNotMatch(agent, /Otherwise forward the task as a fresh `task` run/i);
   assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
   assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
   assert.match(agent, /Use exactly one `Bash` call/i);
@@ -147,6 +147,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /That prompt drafting is the only Claude-side work allowed/i);
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
+  assert.match(runtimeSkill, /Without `--fresh`, use `task --resume-last`/i);
   assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
