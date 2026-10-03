@@ -23,8 +23,13 @@ Docs: <https://code.claude.com/docs/en/plugins/cli-reference.md>, <https://code.
   versions; it follows the marketplace ref. The cache is keyed by the version string
   (`~/.claude/plugins/cache/skress-codex/codex/1.0.6-fork.0`, `installed_plugins.json` also records `gitCommitSha`).
   ⇒ always bump the version when `main` changes, or the cache entry is reused.
-- **Tag pin + update:** with the marketplace pinned to a tag, moving to a new tag means changing the marketplace source
-  ref (re-add). TODO: verify the exact re-pin flow when `v1.0.6-fork.1` exists.
+- **Tag pin + update (verified 2026-10-03, fork.0 → fork.1):** `marketplace add` also writes the source into
+  `~/.claude/settings.json` → `extraKnownMarketplaces.skress-codex.source.ref`. Re-adding with a different ref is refused
+  ("source doesn't match its extraKnownMarketplaces entry"), and after editing only the settings, `marketplace update`
+  reports the marketplace "not found". Working flow:
+  1. set `extraKnownMarketplaces["skress-codex"].source.ref` to the new tag in `~/.claude/settings.json`;
+  2. `claude plugin marketplace add 'skress/codex-plugin-cc#<new tag>'`;
+  3. `claude plugin update codex@skress-codex --scope user` → "updated from 1.0.6-fork.0 to 1.0.6-fork.1"; restart Claude Code.
 - **Node deps:** installed automatically on cache only when the plugin root has `package.json` **and** a lockfile.
   `plugins/codex/` has neither; the companion uses only Node built-ins. Nothing to install.
 
@@ -100,3 +105,11 @@ write to `~/.codex` and `~/.claude/plugins/data/codex-skress-codex`; the app-ser
   checkout root; use a scratch clone.
 - Codex 0.160.0 runs its own managed app-server daemon (`~/.codex/packages/app-server-daemon`), which likely explains
   why an empty `CODEX_HOME` still authenticated in §0.7.
+
+## Session link (`v1.0.6-fork.1`) manual check — 2026-10-03
+
+Headless sessions in a scratch repo, installed plugin at `1.0.6-fork.1`:
+1. `claude -p "/codex:rescue --wait … the secret word is PELICAN …"` → session `09fa748b…`, link → thread `01a101b8-1e7b…`.
+2. Session ended: `SessionEnd` removed the session's jobs (0 left), the link stayed.
+3. `claude -p --resume 09fa748b… "/codex:rescue --wait … what is the secret word?"` → `PELICAN`, same thread.
+4. Same session, `/codex:rescue --fresh --wait … do you know a secret word?` → `No.`, link → new thread `01a101b8-c79f…`.
