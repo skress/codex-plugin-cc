@@ -128,6 +128,7 @@ Runtime (`codex-companion.mjs`):
 - **`--resume-last` / `--resume`** resolve the session's link. If a task job of this session is queued/running → error as today (a thread runs one turn at a time). **If there is no link → start a fresh thread instead of erroring.** Without a session id (script run outside Claude Code): upstream fallback (`findLatestTaskThread`), then fresh.
 - `task` without `--resume-last` stays a fresh run (explicit).
 - `--no-link`: the run doesn't update the link. The stop-gate hook passes it, so gate runs never move the link.
+- `--output-schema <file>` (added 2026-10-12): a JSON Schema file, resolved against the working directory, that constrains Codex's final message. The `--json` payload then also carries `structuredOutput` (the parsed message, or `null`) and `structuredOutputError`. Used by the `converge` skill in boundless-mind/agent-skills for review rounds.
 - `task-resume-candidate --json` reports the linked thread (`available`, `threadId`).
 - `--json` payload gains `errorMessage` (the failure message the runtime already computes; `null` on success) and `resumed` (boolean). Thrown errors stay on stderr with exit 1 and no stdout JSON.
 
