@@ -81,7 +81,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--no-link] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--no-link] [--output-schema <json-schema-file>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -473,6 +473,7 @@ async function executeTaskRun(request) {
     model: request.model,
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : "read-only",
+    outputSchema: request.outputSchema ?? null,
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -505,6 +506,11 @@ async function executeTaskRun(request) {
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary
   };
+  if (request.outputSchema) {
+    const structured = parseStructuredOutput(rawOutput, { failureMessage });
+    payload.structuredOutput = structured.parsed;
+    payload.structuredOutputError = structured.parseError;
+  }
 
   return {
     exitStatus: result.status,
@@ -591,7 +597,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, noLink, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, noLink, outputSchema, jobId }) {
   return {
     cwd,
     model,
@@ -600,6 +606,7 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, noLin
     write,
     resumeLast,
     noLink,
+    outputSchema,
     jobId
   };
 }
@@ -752,7 +759,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "no-link"],
     aliasMap: {
       m: "model"
@@ -772,6 +779,9 @@ async function handleTask(argv) {
   }
   const write = Boolean(options.write);
   const noLink = Boolean(options["no-link"]);
+  const outputSchema = options["output-schema"]
+    ? readOutputSchema(path.resolve(cwd, options["output-schema"]))
+    : null;
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -790,6 +800,7 @@ async function handleTask(argv) {
       write,
       resumeLast,
       noLink,
+      outputSchema,
       jobId: job.id
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
@@ -809,6 +820,7 @@ async function handleTask(argv) {
         write,
         resumeLast,
         noLink,
+        outputSchema,
         jobId: job.id,
         onProgress: progress
       }),
