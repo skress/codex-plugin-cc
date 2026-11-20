@@ -1185,6 +1185,15 @@ export function buildPersistentTaskThreadName(prompt) {
   return buildTaskThreadName(prompt);
 }
 
+// Keyed threads (task --link-key) must not match TASK_THREAD_PREFIX, so the
+// sessionless fallback in findLatestTaskThread never continues one of them.
+const KEYED_TASK_THREAD_PREFIX = "Codex Companion Keyed";
+
+export function buildKeyedTaskThreadName(linkKey, prompt) {
+  const excerpt = shorten(prompt, 48);
+  return excerpt ? `${KEYED_TASK_THREAD_PREFIX} [${linkKey}]: ${excerpt}` : `${KEYED_TASK_THREAD_PREFIX} [${linkKey}]`;
+}
+
 export function parseStructuredOutput(rawOutput, fallback = {}) {
   if (!rawOutput) {
     return {

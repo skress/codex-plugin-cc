@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { resolveStateDir, setSessionLink } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -514,17 +514,15 @@ test("task-resume-candidate returns the thread linked to the current session", (
       {
         version: 1,
         config: { stopReviewGate: false },
-        jobs: [],
-        links: {
-          "sess-current": { threadId: "thr_current", updatedAt: new Date().toISOString() },
-          "sess-other": { threadId: "thr_other", updatedAt: new Date().toISOString() }
-        }
+        jobs: []
       },
       null,
       2
     )}\n`,
     "utf8"
   );
+  setSessionLink(workspace, "sess-current", "thr_current");
+  setSessionLink(workspace, "sess-other", "thr_other");
 
   const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
     cwd: workspace,

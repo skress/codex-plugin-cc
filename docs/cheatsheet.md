@@ -36,7 +36,17 @@ There are no release tags or version bumps. Claude Code versions the plugin by c
 
 ## The session ↔ thread link
 
-Each Claude session is linked to one Codex thread. `/codex:ask` and `/codex:rescue` continue it, also after you quit and `claude --resume`. `--fresh` starts a new thread, which becomes the linked one. `/clear` starts a new Claude session and therefore a new thread. Old threads stay available via `codex resume <id>`.
+Each Claude session is linked to one default Codex thread. `/codex:ask` and `/codex:rescue` continue it, also after you quit and `claude --resume`. `--fresh` starts a new thread, which becomes the linked one. `/clear` starts a new Claude session and therefore a new thread. Old threads stay available via `codex resume <id>`.
+
+Subagents inherit the session, so they would share its default thread. A subagent that should pair with Codex in its own thread passes a key on every call:
+
+```bash
+node "<plugin root>/scripts/codex-companion.mjs" task --link-key task-3-impl --resume-last --json <<'EOF'
+Review the diff of task 3 …
+EOF
+```
+
+The first call starts that key's thread, later calls continue it (check `resumed` and `threadId` in the JSON); the session's default thread is not moved. Links are pruned per workspace (at most 200, none older than 90 days).
 
 ## Commands
 

@@ -130,7 +130,7 @@ Gets a **second opinion** from Codex on the question you are discussing with Cla
 
 Claude writes the prompt: a short summary of the current decision point and what it favors, your question verbatim, and pointers to the relevant files. Codex reads the repository itself, read-only, and answers. Claude then states Codex's position, says where it agrees and disagrees, and what it now recommends, instead of pasting the raw answer.
 
-Each Claude Code session is linked to one Codex thread, so follow-up asks continue the same Codex conversation, also after `claude --resume`. `--fresh` starts a new Codex thread, which becomes the linked one.
+Each Claude Code session is linked to one default Codex thread, so follow-up asks continue the same Codex conversation, also after `claude --resume`. `--fresh` starts a new Codex thread, which becomes the linked one. Subagents that need their own thread call the runtime with `task --link-key <key> --resume-last` (see the cheatsheet).
 
 It supports `--fresh`, `--model`, and `--effort`. It always runs in the foreground.
 

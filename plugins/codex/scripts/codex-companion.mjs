@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
+    buildKeyedTaskThreadName,
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
     findLatestTaskThread,
@@ -81,7 +82,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--no-link] [--output-schema <json-schema-file>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--no-link|--link-key <key>] [--output-schema <json-schema-file>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -297,6 +298,26 @@ function getCurrentClaudeSessionId() {
   return process.env[SESSION_ID_ENV] ?? null;
 }
 
+const LINK_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+function normalizeLinkKey(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const key = String(value);
+  if (!LINK_KEY_PATTERN.test(key)) {
+    throw new Error("--link-key must be 1-128 characters of letters, digits, '.', '_', ':' or '-', starting with a letter or digit.");
+  }
+  return key;
+}
+
+// A link key gives one caller (for example a subagent) its own thread within the
+// Claude session. The link is stored under "<session id>#<key>"; neither part can
+// contain "#". Jobs stay owned by the real session.
+function linkStoreKey(sessionId, linkKey) {
+  return linkKey ? `${sessionId ?? ""}#${linkKey}` : sessionId;
+}
+
 function filterJobsForCurrentClaudeSession(jobs) {
   const sessionId = getCurrentClaudeSessionId();
   if (!sessionId) {
@@ -327,10 +348,22 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
+  const linkKey = options.linkKey ?? null;
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
-  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
+  const activeTask = visibleJobs.find(
+    (job) =>
+      job.jobClass === "task" &&
+      (job.status === "queued" || job.status === "running") &&
+      (job.linkKey ?? null) === linkKey &&
+      (!linkKey || (job.sessionId ?? null) === (sessionId ?? null))
+  );
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
+  }
+
+  if (linkKey) {
+    const link = getSessionLink(workspaceRoot, linkStoreKey(sessionId, linkKey));
+    return link ? { id: link.threadId } : null;
   }
 
   if (sessionId) {
@@ -456,7 +489,8 @@ async function executeTaskRun(request) {
   let resumeThreadId = null;
   if (request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
-      excludeJobId: request.jobId
+      excludeJobId: request.jobId,
+      linkKey: request.linkKey ?? null
     });
     // No thread to continue yet: start one, which becomes the session's link.
     resumeThreadId = latestThread?.id ?? null;
@@ -476,11 +510,15 @@ async function executeTaskRun(request) {
     outputSchema: request.outputSchema ?? null,
     onProgress: request.onProgress,
     persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    threadName: resumeThreadId
+      ? null
+      : request.linkKey
+        ? buildKeyedTaskThreadName(request.linkKey, request.prompt || DEFAULT_CONTINUE_PROMPT)
+        : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
   });
 
   if (!request.noLink && result.threadId) {
-    setSessionLink(workspaceRoot, getCurrentClaudeSessionId(), result.threadId);
+    setSessionLink(workspaceRoot, linkStoreKey(getCurrentClaudeSessionId(), request.linkKey ?? null), result.threadId);
   }
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -560,7 +598,7 @@ function getJobKindLabel(kind, jobClass) {
   return jobClass === "review" ? "review" : "rescue";
 }
 
-function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
+function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false, linkKey = null }) {
   return createJobRecord({
     id: generateJobId(prefix),
     kind,
@@ -569,7 +607,8 @@ function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summ
     workspaceRoot,
     jobClass,
     summary,
-    write
+    write,
+    ...(linkKey ? { linkKey } : {})
   });
 }
 
@@ -585,7 +624,7 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
+function buildTaskJob(workspaceRoot, taskMetadata, write, linkKey = null) {
   return createCompanionJob({
     prefix: "task",
     kind: "task",
@@ -593,11 +632,12 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     workspaceRoot,
     jobClass: "task",
     summary: taskMetadata.summary,
-    write
+    write,
+    linkKey
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, noLink, outputSchema, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, noLink, linkKey, outputSchema, jobId }) {
   return {
     cwd,
     model,
@@ -606,6 +646,7 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, noLin
     write,
     resumeLast,
     noLink,
+    linkKey,
     outputSchema,
     jobId
   };
@@ -759,7 +800,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema", "link-key"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "no-link"],
     aliasMap: {
       m: "model"
@@ -779,6 +820,10 @@ async function handleTask(argv) {
   }
   const write = Boolean(options.write);
   const noLink = Boolean(options["no-link"]);
+  const linkKey = normalizeLinkKey(options["link-key"]);
+  if (linkKey && noLink) {
+    throw new Error("Choose either --link-key or --no-link.");
+  }
   const outputSchema = options["output-schema"]
     ? readOutputSchema(path.resolve(cwd, options["output-schema"]))
     : null;
@@ -791,7 +836,7 @@ async function handleTask(argv) {
     ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write, linkKey);
     const request = buildTaskRequest({
       cwd,
       model,
@@ -800,6 +845,7 @@ async function handleTask(argv) {
       write,
       resumeLast,
       noLink,
+      linkKey,
       outputSchema,
       jobId: job.id
     });
@@ -808,7 +854,7 @@ async function handleTask(argv) {
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, linkKey);
   await runForegroundCommand(
     job,
     (progress) =>
@@ -820,6 +866,7 @@ async function handleTask(argv) {
         write,
         resumeLast,
         noLink,
+        linkKey,
         outputSchema,
         jobId: job.id,
         onProgress: progress
