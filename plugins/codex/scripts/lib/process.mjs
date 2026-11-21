@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import process from "node:process";
 
 export function runCommand(command, args = [], options = {}) {
@@ -132,4 +133,69 @@ export function formatCommandFailure(result) {
     parts.push(stdout);
   }
   return parts.join(": ");
+}
+
+// A token that identifies one process incarnation: the same pid with a different
+// token is a different (reused) process. Linux: start time in clock ticks from
+// /proc/<pid>/stat. Elsewhere (macOS, BSD): `ps -o lstart=`. null when unknown
+// (Windows, ps missing, process gone); callers then rely on the pid alone.
+export function readProcessStartToken(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+  const platform = options.platform ?? process.platform;
+  if (platform === "win32") {
+    return null;
+  }
+  if (platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      // The command name (field 2) may contain spaces and parentheses; fields after
+      // the last ")" are fixed. starttime is field 22, i.e. index 19 after it.
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      return fields[19] ? `linux:${fields[19]}` : null;
+    } catch {
+      return null;
+    }
+  }
+  const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+    encoding: "utf8",
+    env: { ...process.env, LC_ALL: "C" },
+    timeout: 5000,
+    windowsHide: true
+  });
+  const started = String(result.stdout ?? "").trim().replace(/\s+/g, " ");
+  return result.status === 0 && started ? `ps:${started}` : null;
+}
+
+// "alive", "dead", or "unknown" (no permission to signal it, or no pid).
+export function probeProcess(pid, options = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return "unknown";
+  }
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  try {
+    killImpl(pid, 0);
+    return "alive";
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      return "dead";
+    }
+    return error?.code === "EPERM" ? "alive" : "unknown";
+  }
+}
+
+// A recorded process is gone when its pid no longer exists, or when the pid now
+// belongs to a process with a different start token (pid reuse). Unknown stays
+// "not gone", so a job is never failed on a guess.
+export function isRecordedProcessGone(pid, startToken = null, options = {}) {
+  const state = probeProcess(pid, options);
+  if (state === "dead") {
+    return true;
+  }
+  if (state !== "alive" || !startToken) {
+    return false;
+  }
+  const current = (options.readStartToken ?? readProcessStartToken)(pid);
+  return current !== null && current !== startToken;
 }

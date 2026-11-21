@@ -270,6 +270,11 @@ if (args[0] === "login") {
 if (args[0] !== "app-server") {
   process.exit(1);
 }
+if (BEHAVIOR === "ignores-shutdown") {
+  // An app-server that survives stdin end and SIGTERM; only SIGKILL stops it.
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
+}
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
 saveState(bootState);
@@ -344,10 +349,37 @@ rl.on("line", (line) => {
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
+        state.resumeRequests = (state.resumeRequests || 0) + 1;
+        state.lastResumeParams = message.params;
+        saveState(state);
+        if (BEHAVIOR === "resume-rejects-exclude-turns" && "excludeTurns" in message.params) {
+          send({ id: message.id, error: { code: -32600, message: "Invalid request: unknown field \`excludeTurns\`" } });
+          break;
+        }
+        // Withhold the reply: always, or only in the first app-server process that sees a resume.
+        if (BEHAVIOR === "resume-hangs") {
+          break;
+        }
+        if (BEHAVIOR === "resume-hangs-once" && !state.resumeHangConsumed) {
+          state.resumeHangConsumed = true;
+          saveState(state);
+          break;
+        }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        const resumed = buildThread(thread);
+        if (BEHAVIOR === "resume-large-reply" && !message.params.excludeTurns) {
+          // A big history reply that reaches the client in many chunks.
+          const bigText = "x".repeat(64 * 1024);
+          resumed.turns = Array.from({ length: 48 }, (_, index) => ({
+            id: "turn_hist_" + index,
+            status: "completed",
+            error: null,
+            items: [{ type: "agentMessage", id: "msg_hist_" + index, text: bigText, phase: "final_answer" }]
+          }));
+        }
+        send({ id: message.id, result: { thread: resumed, model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         break;
       }
 
@@ -452,8 +484,19 @@ rl.on("line", (line) => {
 	          outputSchema: message.params.outputSchema ?? null,
 	          prompt
 	        };
+	        state.turnStartRequests = (state.turnStartRequests || 0) + 1;
 	        saveState(state);
+	        if (BEHAVIOR === "turn-start-hangs") {
+	          break;
+	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+	        if (BEHAVIOR === "turn-never-completes") {
+	          // Acknowledge the turn and go quiet; only turn/interrupt ends it.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          interruptibleTurns.set(turnId, { threadId: thread.id, timer: null });
+	          break;
+	        }
 
         if (BEHAVIOR === "turn-fails") {
           const error = { message: "The 'no-such-model' model is not supported when using Codex with a ChatGPT account." };

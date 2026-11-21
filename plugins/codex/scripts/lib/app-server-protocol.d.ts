@@ -54,6 +54,10 @@ export interface CodexAppServerClientOptions {
   brokerEndpoint?: string;
   disableBroker?: boolean;
   reuseExistingBroker?: boolean;
+  /** Per-request limit; defaults to CODEX_COMPANION_RPC_TIMEOUT_MS or two minutes. */
+  requestTimeoutMs?: number;
+  /** Limit for close(); defaults to CODEX_COMPANION_CLOSE_TIMEOUT_MS or ten seconds. */
+  closeTimeoutMs?: number;
 }
 
 export interface AppServerMethodMap {

@@ -6,10 +6,18 @@ import path from "node:path";
 import process from "node:process";
 
 import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import {
+  BROKER_BUSY_RPC_CODE,
+  BROKER_UPSTREAM_TIMEOUT_RPC_CODE,
+  CodexAppServerClient,
+  isRequestTimeoutError
+} from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+// Killing a wedged app-server should not take long; the client waits for the
+// broker's answer, which comes after the restart.
+const UPSTREAM_CLOSE_TIMEOUT_MS = 2000;
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -65,20 +73,82 @@ async function main() {
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
   writePidFile(pidFile);
 
-  const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+  let appClient = await connectUpstream();
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let activeStreamTurn = null;
+  // Set when the app-server must be replaced (a request timed out, or it exited).
+  // While set, new requests are answered busy; the restart runs once no client
+  // owns the broker, so it never kills another client's running turn.
+  let restartReason = null;
+  let restarting = null;
   const sockets = new Set();
 
+  async function connectUpstream() {
+    const client = await CodexAppServerClient.connect(cwd, {
+      disableBroker: true,
+      closeTimeoutMs: UPSTREAM_CLOSE_TIMEOUT_MS
+    });
+    client.setNotificationHandler((message) => routeNotification(message));
+    client.exitPromise.then(() => {
+      if (appClient === client && !client.closed) {
+        // The app-server died on its own: clients waiting on it get disconnected,
+        // and the next request starts a new one.
+        restartReason = restartReason ?? "exited";
+        for (const socket of [activeRequestSocket, activeStreamSocket]) {
+          socket?.destroy();
+        }
+        activeRequestSocket = null;
+        activeStreamSocket = null;
+        activeStreamThreadIds = null;
+        activeStreamTurn = null;
+      }
+    });
+    return client;
+  }
+
+  function isOwned() {
+    return Boolean(activeRequestSocket || activeStreamSocket);
+  }
+
+  async function restartUpstreamIfIdle() {
+    if (!restartReason || isOwned()) {
+      return;
+    }
+    if (!restarting) {
+      restarting = (async () => {
+        const previous = appClient;
+        await previous.close().catch(() => {});
+        try {
+          appClient = await connectUpstream();
+          restartReason = null;
+        } catch (error) {
+          process.stderr.write(`Failed to restart the Codex app-server: ${error instanceof Error ? error.message : String(error)}\n`);
+        }
+      })().finally(() => {
+        restarting = null;
+      });
+    }
+    await restarting;
+  }
+
   function clearSocketOwnership(socket) {
+    if (activeStreamSocket === socket && activeStreamTurn && !restartReason) {
+      // The client of a running turn went away: stop the turn instead of leaving
+      // it running for nobody (and routing its events to the next client).
+      const { threadId, turnId } = activeStreamTurn;
+      appClient.request("turn/interrupt", { threadId, turnId }).catch(() => {});
+    }
     if (activeRequestSocket === socket) {
       activeRequestSocket = null;
     }
     if (activeStreamSocket === socket) {
       activeStreamSocket = null;
       activeStreamThreadIds = null;
+      activeStreamTurn = null;
     }
+    void restartUpstreamIfIdle();
   }
 
   function routeNotification(message) {
@@ -92,9 +162,11 @@ async function main() {
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
         activeStreamSocket = null;
         activeStreamThreadIds = null;
+        activeStreamTurn = null;
         if (activeRequestSocket === target) {
           activeRequestSocket = null;
         }
+        void restartUpstreamIfIdle();
       }
     }
   }
@@ -112,8 +184,6 @@ async function main() {
       fs.unlinkSync(pidFile);
     }
   }
-
-  appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -170,9 +240,15 @@ async function main() {
         const allowInterruptDuringActiveStream =
           isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
 
+        if (!isOwned() && restartReason) {
+          await restartUpstreamIfIdle();
+        }
+
         if (
-          ((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
-          !allowInterruptDuringActiveStream
+          (((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
+            !allowInterruptDuringActiveStream) ||
+          restarting ||
+          (restartReason && !(activeStreamSocket === socket || activeRequestSocket === socket))
         ) {
           send(socket, {
             id: message.id,
@@ -196,18 +272,49 @@ async function main() {
 
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        const upstream = appClient;
 
         try {
-          const result = await appClient.request(message.method, message.params ?? {});
+          const result = await upstream.request(message.method, message.params ?? {});
+          if (socket.destroyed) {
+            // The client left while the request ran; the reply has no reader.
+            return;
+          }
           send(socket, { id: message.id, result });
           if (isStreaming) {
             activeStreamSocket = socket;
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            const turnId = result?.turn?.id ?? null;
+            const threadId = message.params?.threadId ?? null;
+            activeStreamTurn = turnId && threadId ? { threadId, turnId } : null;
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
         } catch (error) {
+          if (isRequestTimeoutError(error) && upstream === appClient) {
+            // The app-server did not answer in time: it may be wedged (for example
+            // in a thread/resume that never returns, holding the thread). Replace
+            // it, then tell the client, so its retry reaches the new app-server.
+            restartReason = restartReason ?? "timeout";
+            if (activeRequestSocket === socket) {
+              activeRequestSocket = null;
+            }
+            if (activeStreamSocket === socket) {
+              activeStreamSocket = null;
+              activeStreamThreadIds = null;
+              activeStreamTurn = null;
+            }
+            await restartUpstreamIfIdle();
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(
+                BROKER_UPSTREAM_TIMEOUT_RPC_CODE,
+                `${error.message}${restartReason ? " The shared broker will restart it once it is idle." : " The shared broker restarted it."}`
+              )
+            });
+            continue;
+          }
           send(socket, {
             id: message.id,
             error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)

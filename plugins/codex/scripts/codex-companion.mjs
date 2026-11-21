@@ -25,7 +25,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, readProcessStartToken, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -52,6 +52,7 @@ import {
   createJobRecord,
   createProgressReporter,
   nowIso,
+  reconcileDeadJobs,
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
@@ -347,6 +348,8 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
+  // A job whose process died (killed client, crash) must not block the key forever.
+  reconcileDeadJobs(workspaceRoot);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const linkKey = options.linkKey ?? null;
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
@@ -730,6 +733,7 @@ function enqueueBackgroundTask(cwd, job, request) {
     status: "queued",
     phase: "queued",
     pid: child.pid ?? null,
+    pidStartToken: child.pid ? readProcessStartToken(child.pid) : null,
     logFile,
     request
   };

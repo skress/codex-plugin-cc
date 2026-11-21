@@ -21,6 +21,31 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+// The shared broker answers with this code when its Codex app-server did not
+// answer a forwarded request in time; the broker then restarts that app-server.
+export const BROKER_UPSTREAM_TIMEOUT_RPC_CODE = -32002;
+export const RPC_TIMEOUT_ERROR_CODE = "RPC_TIMEOUT";
+
+export const RPC_TIMEOUT_ENV = "CODEX_COMPANION_RPC_TIMEOUT_MS";
+export const TURN_IDLE_TIMEOUT_ENV = "CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS";
+export const CLOSE_TIMEOUT_ENV = "CODEX_COMPANION_CLOSE_TIMEOUT_MS";
+// A request to the app-server (thread/start, thread/resume, turn/start, ...) only
+// sets work up; the turn itself runs after turn/start returned. Two minutes is far
+// above what a healthy app-server needs (a resume of a 1.5 MB thread answers in
+// about 25 ms) and short enough that a wedged one does not block a caller for long.
+export const DEFAULT_RPC_TIMEOUT_MS = 2 * 60 * 1000;
+// Waiting for a turn to finish is bounded by inactivity, not by total duration:
+// long review turns are legitimate, a turn with no event for 30 minutes is not.
+export const DEFAULT_TURN_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+export const DEFAULT_CLOSE_TIMEOUT_MS = 10 * 1000;
+// Through the broker the companion waits a little longer than the broker waits for
+// its app-server, so the broker's answer (and its restart) arrives first.
+const BROKER_CLIENT_GRACE_MS = 10 * 1000;
+
+export function resolveTimeoutMs(envName, fallback, env = process.env) {
+  const value = Number(env?.[envName]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -54,6 +79,36 @@ function createProtocolError(message, data) {
   return error;
 }
 
+function formatSeconds(ms) {
+  const seconds = ms / 1000;
+  return Number.isInteger(seconds) ? `${seconds}s` : `${seconds.toFixed(1)}s`;
+}
+
+function createTimeoutError(method, timeoutMs) {
+  const error = /** @type {ProtocolError & { code?: string, method?: string, timeoutMs?: number }} */ (
+    new Error(`Codex app-server did not answer ${method} within ${formatSeconds(timeoutMs)}.`)
+  );
+  error.code = RPC_TIMEOUT_ERROR_CODE;
+  error.method = method;
+  error.timeoutMs = timeoutMs;
+  return error;
+}
+
+export function isRequestTimeoutError(error) {
+  return error?.code === RPC_TIMEOUT_ERROR_CODE || error?.rpcCode === BROKER_UPSTREAM_TIMEOUT_RPC_CODE;
+}
+
+function waitWithLimit(promise, timeoutMs) {
+  let timer = null;
+  return Promise.race([
+    promise.then(() => true),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+      timer.unref?.();
+    })
+  ]).finally(() => clearTimeout(timer));
+}
+
 class AppServerClientBase {
   constructor(cwd, options = {}) {
     this.cwd = cwd;
@@ -67,6 +122,9 @@ class AppServerClientBase {
     this.notificationHandler = null;
     this.lineBuffer = "";
     this.transport = "unknown";
+    const env = options.env ?? process.env;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? resolveTimeoutMs(RPC_TIMEOUT_ENV, DEFAULT_RPC_TIMEOUT_MS, env);
+    this.closeTimeoutMs = options.closeTimeoutMs ?? resolveTimeoutMs(CLOSE_TIMEOUT_ENV, DEFAULT_CLOSE_TIMEOUT_MS, env);
 
     this.exitPromise = new Promise((resolve) => {
       this.resolveExit = resolve;
@@ -81,19 +139,42 @@ class AppServerClientBase {
    * @template {AppServerMethod} M
    * @param {M} method
    * @param {import("./app-server-protocol").AppServerRequestParams<M>} params
+   * @param {{ timeoutMs?: number }} [options]
    * @returns {Promise<import("./app-server-protocol").AppServerResponse<M>>}
    */
-  request(method, params) {
+  request(method, params, options = {}) {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
     }
 
     const id = this.nextId;
     this.nextId += 1;
+    const timeoutMs = options.timeoutMs ?? this.requestTimeoutMs;
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
-      this.sendMessage({ id, method, params });
+      let timer = null;
+      const settle = (fn) => (value) => {
+        clearTimeout(timer);
+        fn(value);
+      };
+      this.pending.set(id, { resolve: settle(resolve), reject: settle(reject), method });
+      if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        // On timeout the request is forgotten: a late reply finds no pending entry
+        // and is dropped.
+        timer = setTimeout(() => {
+          if (this.pending.delete(id)) {
+            reject(createTimeoutError(method, timeoutMs));
+          }
+        }, timeoutMs);
+        timer.unref?.();
+      }
+      try {
+        this.sendMessage({ id, method, params });
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(error);
+      }
     });
   }
 
@@ -262,7 +343,21 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       }, 50).unref?.();
     }
 
-    await this.exitPromise;
+    // An app-server that ignores stdin end and SIGTERM is killed, so closing
+    // never blocks the caller for longer than the close limit.
+    if (await waitWithLimit(this.exitPromise, this.closeTimeoutMs)) {
+      return;
+    }
+    if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
+      try {
+        this.proc.kill("SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+    if (!(await waitWithLimit(this.exitPromise, this.closeTimeoutMs))) {
+      this.handleExit(new Error("codex app-server did not exit after SIGKILL."));
+    }
   }
 
   sendMessage(message) {
@@ -280,6 +375,9 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     super(cwd, options);
     this.transport = "broker";
     this.endpoint = options.brokerEndpoint;
+    if (options.requestTimeoutMs === undefined) {
+      this.requestTimeoutMs += Math.min(BROKER_CLIENT_GRACE_MS, this.requestTimeoutMs);
+    }
   }
 
   async initialize() {
@@ -319,7 +417,12 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     if (this.socket) {
       this.socket.end();
     }
-    await this.exitPromise;
+    if (!(await waitWithLimit(this.exitPromise, this.closeTimeoutMs))) {
+      this.socket?.destroy();
+      if (!(await waitWithLimit(this.exitPromise, this.closeTimeoutMs))) {
+        this.handleExit(new Error("codex app-server broker connection did not close."));
+      }
+    }
   }
 
   sendMessage(message) {

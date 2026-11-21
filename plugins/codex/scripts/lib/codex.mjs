@@ -40,7 +40,16 @@ import os from "node:os";
 import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
-import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
+import {
+  BROKER_BUSY_RPC_CODE,
+  BROKER_ENDPOINT_ENV,
+  BROKER_UPSTREAM_TIMEOUT_RPC_CODE,
+  CodexAppServerClient,
+  DEFAULT_TURN_IDLE_TIMEOUT_MS,
+  TURN_IDLE_TIMEOUT_ENV,
+  isRequestTimeoutError,
+  resolveTimeoutMs
+} from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
@@ -50,6 +59,7 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
+const INTERRUPT_TIMEOUT_MS = 10 * 1000;
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -78,7 +88,10 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    sandbox: options.sandbox ?? "read-only",
+    // The companion needs only the thread id back. Without this the app-server
+    // rebuilds and sends the whole turn history (hundreds of KB for one review turn).
+    ...(options.excludeTurns === false ? {} : { excludeTurns: true })
   };
 }
 
@@ -556,11 +569,57 @@ function applyTurnNotification(state, message) {
   }
 }
 
+function describeTurnStartTimeout(error, threadId) {
+  return new Error(
+    `${error.message} The turn may still be running on thread ${threadId}; check it with \`codex resume ${threadId}\` before sending the prompt again.`,
+    { cause: error }
+  );
+}
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+  const idleTimeoutMs = options.idleTimeoutMs ?? resolveTimeoutMs(TURN_IDLE_TIMEOUT_ENV, DEFAULT_TURN_IDLE_TIMEOUT_MS);
+  let idleTimer = null;
+  let waiting = false;
+
+  const armIdleTimer = () => {
+    clearTimeout(idleTimer);
+    if (!waiting || state.completed) {
+      return;
+    }
+    idleTimer = setTimeout(() => {
+      void abandonIdleTurn();
+    }, idleTimeoutMs);
+    idleTimer.unref?.();
+  };
+
+  // A turn with no event for the idle limit is interrupted (best effort) and
+  // reported as failed; legitimate long turns keep producing events.
+  const abandonIdleTurn = async () => {
+    if (state.completed) {
+      return;
+    }
+    state.completed = true;
+    clearCompletionTimer(state);
+    const minutes = idleTimeoutMs / 60000;
+    const span = minutes >= 1 ? `${Number(minutes.toFixed(1))} min` : `${idleTimeoutMs / 1000}s`;
+    let interruptNote = "";
+    if (state.turnId) {
+      try {
+        await client.request("turn/interrupt", { threadId: state.threadId, turnId: state.turnId }, { timeoutMs: INTERRUPT_TIMEOUT_MS });
+        interruptNote = " The turn was interrupted.";
+      } catch (error) {
+        interruptNote = ` Interrupting the turn failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+    state.rejectCompletion(
+      new Error(`No activity from Codex for ${span} on turn ${state.turnId ?? "(unknown)"} of thread ${state.threadId}.${interruptNote}`)
+    );
+  };
 
   client.setNotificationHandler((message) => {
+    armIdleTimer();
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
@@ -582,7 +641,12 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   });
 
   try {
-    const response = await startRequest();
+    let response;
+    try {
+      response = await startRequest();
+    } catch (error) {
+      throw isRequestTimeoutError(error) ? describeTurnStartTimeout(error, threadId) : error;
+    }
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
@@ -603,8 +667,19 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    waiting = true;
+    armIdleTimer();
+    // A connection that closes mid-turn (broker or app-server gone) ends the wait.
+    const connectionClosed = client.exitPromise.then(() => {
+      throw new Error(
+        `The connection to Codex closed before turn ${state.turnId ?? "(unknown)"} of thread ${state.threadId} finished.${client.exitError?.message ? ` ${client.exitError.message}` : ""}`
+      );
+    });
+    connectionClosed.catch(() => {});
+    return await Promise.race([state.completion, connectionClosed]);
   } finally {
+    waiting = false;
+    clearTimeout(idleTimer);
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
@@ -747,8 +822,49 @@ async function startThread(client, cwd, options = {}) {
   return response;
 }
 
+function rejectsExcludeTurns(error) {
+  const message = String(error?.message ?? "");
+  return /excludeTurns|exclude_turns/i.test(message) && (error?.rpcCode === -32600 || error?.rpcCode === -32602);
+}
+
 async function resumeThread(client, threadId, cwd, options = {}) {
-  return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
+  const attempt = async (resumeOptions) => {
+    try {
+      return await client.request("thread/resume", buildResumeParams(threadId, cwd, resumeOptions));
+    } catch (error) {
+      // An app-server that predates excludeTurns and rejects unknown fields.
+      if (resumeOptions.excludeTurns !== false && rejectsExcludeTurns(error)) {
+        return attempt({ ...resumeOptions, excludeTurns: false });
+      }
+      throw error;
+    }
+  };
+
+  try {
+    return await attempt(options);
+  } catch (error) {
+    // The shared broker restarted its wedged app-server after this timeout; a
+    // resume has no side effects, so one retry on the fresh app-server is safe.
+    if (error?.rpcCode === BROKER_UPSTREAM_TIMEOUT_RPC_CODE && !client.closed) {
+      emitProgress(options.onProgress, `Codex did not answer the resume; retrying once on a restarted app-server.`, "starting");
+      try {
+        return await attempt(options);
+      } catch (retryError) {
+        throw describeResumeTimeout(retryError, threadId);
+      }
+    }
+    throw describeResumeTimeout(error, threadId);
+  }
+}
+
+function describeResumeTimeout(error, threadId) {
+  if (!isRequestTimeoutError(error)) {
+    return error;
+  }
+  return new Error(
+    `${error.message} Resuming thread ${threadId} did not finish; no turn was started. Retry the command; if it keeps failing, start a new thread with --fresh.`,
+    { cause: error }
+  );
 }
 
 function buildResultStatus(turnState) {
@@ -1106,7 +1222,8 @@ export async function runAppServerTurn(cwd, options = {}) {
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
         sandbox: options.sandbox,
-        ephemeral: false
+        ephemeral: false,
+        onProgress: options.onProgress
       });
       threadId = response.thread.id;
     } else {

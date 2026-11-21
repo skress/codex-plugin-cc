@@ -1,7 +1,9 @@
 import fs from "node:fs";
+import os from "node:os";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { isRecordedProcessGone, readProcessStartToken } from "./process.mjs";
+import { listJobs, readJobFile, resolveJobFile, resolveJobLogFile, updateState, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -131,6 +133,98 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   };
 }
 
+function isActiveStatus(status) {
+  return status === "queued" || status === "running";
+}
+
+// Marks a job failed only while it is still active (and, with expectedPid, still
+// owned by that process), in both the state index and the job file. A job that
+// finished, was cancelled or was removed meanwhile is left alone. Returns whether
+// the index entry changed.
+export function failActiveJob(workspaceRoot, jobId, errorMessage, options = {}) {
+  const completedAt = nowIso();
+  let changed = false;
+  let logFile = null;
+  updateState(workspaceRoot, (state) => {
+    const current = state.jobs.find((job) => job.id === jobId);
+    if (!current || !isActiveStatus(current.status)) {
+      return;
+    }
+    if (options.expectedPid !== undefined && current.pid !== options.expectedPid) {
+      return;
+    }
+    Object.assign(current, { status: "failed", phase: "failed", pid: null, errorMessage, completedAt, updatedAt: completedAt });
+    logFile = current.logFile ?? null;
+    changed = true;
+  });
+  if (!changed) {
+    return false;
+  }
+  const jobFile = resolveJobFile(workspaceRoot, jobId);
+  if (fs.existsSync(jobFile)) {
+    try {
+      const stored = readJobFile(jobFile);
+      if (!stored.status || isActiveStatus(stored.status)) {
+        writeJobFile(workspaceRoot, jobId, { ...stored, status: "failed", phase: "failed", pid: null, errorMessage, completedAt });
+      }
+      logFile = logFile ?? stored.logFile ?? null;
+    } catch {
+      // An unreadable job file keeps its content; the index already says failed.
+    }
+  }
+  try {
+    appendLogLine(logFile, errorMessage);
+  } catch {
+    // The log is informational.
+  }
+  return true;
+}
+
+// A queued or running job whose recorded process is gone (exited, killed, or its
+// pid now belongs to another process) can never finish: mark it failed so it no
+// longer blocks its link key or shows as running. Jobs without a recorded pid are
+// left alone.
+export function reconcileDeadJobs(workspaceRoot, options = {}) {
+  const isGone = options.isGone ?? ((job) => isRecordedProcessGone(job.pid, job.pidStartToken ?? null));
+  const reconciled = [];
+  for (const job of listJobs(workspaceRoot)) {
+    if (!isActiveStatus(job.status) || !Number.isInteger(job.pid) || job.pid <= 0 || !isGone(job)) {
+      continue;
+    }
+    const message = `The Codex companion process (pid ${job.pid}) exited before the job finished.`;
+    if (failActiveJob(workspaceRoot, job.id, message, { expectedPid: job.pid })) {
+      reconciled.push(job.id);
+    }
+  }
+  return reconciled;
+}
+
+const TERMINATION_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"];
+
+// While a job runs in this process, a termination signal marks it failed before
+// the process exits (SIGKILL cannot be caught; reconcileDeadJobs covers that).
+function installSignalHandlers(workspaceRoot, jobId) {
+  if (process.platform === "win32") {
+    return () => {};
+  }
+  const handlers = TERMINATION_SIGNALS.map((signal) => {
+    const handler = () => {
+      try {
+        failActiveJob(workspaceRoot, jobId, `Interrupted by ${signal}.`, { expectedPid: process.pid });
+      } finally {
+        process.exit(128 + (os.constants.signals[signal] ?? 0));
+      }
+    };
+    process.on(signal, handler);
+    return [signal, handler];
+  });
+  return () => {
+    for (const [signal, handler] of handlers) {
+      process.off(signal, handler);
+    }
+  };
+}
+
 function readStoredJobOrNull(workspaceRoot, jobId) {
   const jobFile = resolveJobFile(workspaceRoot, jobId);
   if (!fs.existsSync(jobFile)) {
@@ -146,10 +240,12 @@ export async function runTrackedJob(job, runner, options = {}) {
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
+    pidStartToken: readProcessStartToken(process.pid),
     logFile: options.logFile ?? job.logFile ?? null
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
   upsertJob(job.workspaceRoot, runningRecord);
+  const removeSignalHandlers = installSignalHandlers(job.workspaceRoot, job.id);
 
   try {
     const execution = await runner();
@@ -200,5 +296,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       completedAt
     });
     throw error;
+  } finally {
+    removeSignalHandlers();
   }
 }
