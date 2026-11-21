@@ -40,7 +40,8 @@ export const DEFAULT_TURN_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 export const DEFAULT_CLOSE_TIMEOUT_MS = 10 * 1000;
 // Through the broker the companion waits a little longer than the broker waits for
 // its app-server, so the broker's answer (and its restart) arrives first.
-const BROKER_CLIENT_GRACE_MS = 10 * 1000;
+const BROKER_CLIENT_GRACE_MS = 30 * 1000;
+const SIGKILL_WAIT_MS = 2000;
 
 export function resolveTimeoutMs(envName, fallback, env = process.env) {
   const value = Number(env?.[envName]);
@@ -276,6 +277,13 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       windowsHide: true
     });
 
+    // Settles when the process itself is gone (exit, or it never started),
+    // which can be later than the protocol connection ending.
+    this.processGone = new Promise((resolve) => {
+      this.proc.once("exit", resolve);
+      this.proc.once("error", resolve);
+    });
+
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
 
@@ -301,6 +309,13 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.readline = readline.createInterface({ input: this.proc.stdout });
     this.readline.on("line", (line) => {
       this.handleLine(line);
+    });
+    // The protocol stream ended: nothing can answer any more, even if the
+    // process keeps running. close() still stops the process.
+    this.readline.on("close", () => {
+      if (!this.closed) {
+        this.handleExit(createProtocolError("codex app-server closed its output stream."));
+      }
     });
 
     await this.request("initialize", {
@@ -344,20 +359,19 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     }
 
     // An app-server that ignores stdin end and SIGTERM is killed, so closing
-    // never blocks the caller for longer than the close limit.
-    if (await waitWithLimit(this.exitPromise, this.closeTimeoutMs)) {
-      return;
-    }
-    if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
-      try {
-        this.proc.kill("SIGKILL");
-      } catch {
-        // Already gone.
+    // never blocks the caller for much longer than the close limit.
+    const gone = this.processGone ?? this.exitPromise;
+    if (!(await waitWithLimit(gone, this.closeTimeoutMs))) {
+      if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
+        try {
+          this.proc.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
       }
+      await waitWithLimit(gone, Math.min(SIGKILL_WAIT_MS, this.closeTimeoutMs));
     }
-    if (!(await waitWithLimit(this.exitPromise, this.closeTimeoutMs))) {
-      this.handleExit(new Error("codex app-server did not exit after SIGKILL."));
-    }
+    this.handleExit(null);
   }
 
   sendMessage(message) {
@@ -419,10 +433,9 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     }
     if (!(await waitWithLimit(this.exitPromise, this.closeTimeoutMs))) {
       this.socket?.destroy();
-      if (!(await waitWithLimit(this.exitPromise, this.closeTimeoutMs))) {
-        this.handleExit(new Error("codex app-server broker connection did not close."));
-      }
+      await waitWithLimit(this.exitPromise, Math.min(SIGKILL_WAIT_MS, this.closeTimeoutMs));
     }
+    this.handleExit(null);
   }
 
   sendMessage(message) {
@@ -451,7 +464,13 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
+    try {
+      await client.initialize();
+    } catch (error) {
+      // The caller never gets this client, so stop its process or socket here.
+      await client.close().catch(() => {});
+      throw error;
+    }
     return client;
   }
 }

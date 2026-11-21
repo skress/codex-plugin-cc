@@ -3,7 +3,7 @@ import os from "node:os";
 import process from "node:process";
 
 import { isRecordedProcessGone, readProcessStartToken } from "./process.mjs";
-import { listJobs, readJobFile, resolveJobFile, resolveJobLogFile, updateState, upsertJob, writeJobFile } from "./state.mjs";
+import { listJobs, loadState, readJobFile, resolveJobFile, resolveJobLogFile, saveState, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -141,25 +141,21 @@ function isActiveStatus(status) {
 // owned by that process), in both the state index and the job file. A job that
 // finished, was cancelled or was removed meanwhile is left alone. Returns whether
 // the index entry changed.
+//
+// The job store has no lock (see docs/handover.md), so this narrows rather than
+// closes the races: the state is re-read right before each write, nothing is
+// written when the job is no longer active, and the job file is written before
+// the index, so a crash in between leaves the index active and a later
+// reconciliation finishes the job file and the index together.
 export function failActiveJob(workspaceRoot, jobId, errorMessage, options = {}) {
-  const completedAt = nowIso();
-  let changed = false;
-  let logFile = null;
-  updateState(workspaceRoot, (state) => {
-    const current = state.jobs.find((job) => job.id === jobId);
-    if (!current || !isActiveStatus(current.status)) {
-      return;
-    }
-    if (options.expectedPid !== undefined && current.pid !== options.expectedPid) {
-      return;
-    }
-    Object.assign(current, { status: "failed", phase: "failed", pid: null, errorMessage, completedAt, updatedAt: completedAt });
-    logFile = current.logFile ?? null;
-    changed = true;
-  });
-  if (!changed) {
+  const isOurs = (job) =>
+    job && isActiveStatus(job.status) && (options.expectedPid === undefined || job.pid === options.expectedPid);
+  const indexed = listJobs(workspaceRoot).find((job) => job.id === jobId);
+  if (!isOurs(indexed)) {
     return false;
   }
+  const completedAt = nowIso();
+  let logFile = indexed.logFile ?? null;
   const jobFile = resolveJobFile(workspaceRoot, jobId);
   if (fs.existsSync(jobFile)) {
     try {
@@ -169,9 +165,16 @@ export function failActiveJob(workspaceRoot, jobId, errorMessage, options = {}) 
       }
       logFile = logFile ?? stored.logFile ?? null;
     } catch {
-      // An unreadable job file keeps its content; the index already says failed.
+      // An unreadable job file keeps its content; the index still gets updated.
     }
   }
+  const state = loadState(workspaceRoot);
+  const current = state.jobs.find((job) => job.id === jobId);
+  if (!isOurs(current)) {
+    return false;
+  }
+  Object.assign(current, { status: "failed", phase: "failed", pid: null, errorMessage, completedAt, updatedAt: completedAt });
+  saveState(workspaceRoot, state);
   try {
     appendLogLine(logFile, errorMessage);
   } catch {

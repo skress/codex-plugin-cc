@@ -10,7 +10,10 @@ import {
   BROKER_BUSY_RPC_CODE,
   BROKER_UPSTREAM_TIMEOUT_RPC_CODE,
   CodexAppServerClient,
-  isRequestTimeoutError
+  DEFAULT_RPC_TIMEOUT_MS,
+  RPC_TIMEOUT_ENV,
+  isRequestTimeoutError,
+  resolveTimeoutMs
 } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
@@ -18,6 +21,18 @@ const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact
 // Killing a wedged app-server should not take long; the client waits for the
 // broker's answer, which comes after the restart.
 const UPSTREAM_CLOSE_TIMEOUT_MS = 2000;
+const SHUTDOWN_STEP_TIMEOUT_MS = 2000;
+
+function withLimit(promise, timeoutMs) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+      timer.unref?.();
+    })
+  ]).finally(() => clearTimeout(timer));
+}
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -83,6 +98,11 @@ async function main() {
   // owns the broker, so it never kills another client's running turn.
   let restartReason = null;
   let restarting = null;
+  // A turn whose client went away keeps the broker owned (by the closed socket,
+  // which receives nothing) until the turn ends; it is interrupted, and if it does
+  // not end within the request limit the app-server is replaced.
+  let orphanTimer = null;
+  const orphanLimitMs = resolveTimeoutMs(RPC_TIMEOUT_ENV, DEFAULT_RPC_TIMEOUT_MS);
   const sockets = new Set();
 
   async function connectUpstream() {
@@ -99,10 +119,8 @@ async function main() {
         for (const socket of [activeRequestSocket, activeStreamSocket]) {
           socket?.destroy();
         }
+        releaseStream();
         activeRequestSocket = null;
-        activeStreamSocket = null;
-        activeStreamThreadIds = null;
-        activeStreamTurn = null;
       }
     });
     return client;
@@ -133,20 +151,54 @@ async function main() {
     await restarting;
   }
 
-  function clearSocketOwnership(socket) {
-    if (activeStreamSocket === socket && activeStreamTurn && !restartReason) {
-      // The client of a running turn went away: stop the turn instead of leaving
-      // it running for nobody (and routing its events to the next client).
-      const { threadId, turnId } = activeStreamTurn;
-      appClient.request("turn/interrupt", { threadId, turnId }).catch(() => {});
+  function releaseStream() {
+    clearTimeout(orphanTimer);
+    orphanTimer = null;
+    activeStreamSocket = null;
+    activeStreamThreadIds = null;
+    activeStreamTurn = null;
+  }
+
+  function replaceUpstream(reason) {
+    restartReason = restartReason ?? reason;
+    activeRequestSocket = null;
+    releaseStream();
+    void restartUpstreamIfIdle();
+  }
+
+  // The client of a running turn went away: stop the turn instead of leaving it
+  // running for nobody and routing its events to the next client.
+  function abandonOrphanTurn() {
+    if (!activeStreamTurn || orphanTimer) {
+      return;
     }
+    const { threadId, turnId } = activeStreamTurn;
+    const upstream = appClient;
+    orphanTimer = setTimeout(() => {
+      if (appClient === upstream && activeStreamSocket?.destroyed) {
+        replaceUpstream("orphaned turn did not end");
+      }
+    }, orphanLimitMs);
+    orphanTimer.unref?.();
+    upstream.request("turn/interrupt", { threadId, turnId }).catch(() => {
+      if (appClient === upstream && activeStreamSocket?.destroyed) {
+        replaceUpstream("orphaned turn could not be interrupted");
+      }
+    });
+  }
+
+  function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
-      activeRequestSocket = null;
+      // Its request is still running upstream; ownership is released when the
+      // request settles (see the request handler), never before.
+      return;
     }
     if (activeStreamSocket === socket) {
-      activeStreamSocket = null;
-      activeStreamThreadIds = null;
-      activeStreamTurn = null;
+      if (activeStreamTurn && !restartReason) {
+        abandonOrphanTurn();
+        return;
+      }
+      releaseStream();
     }
     void restartUpstreamIfIdle();
   }
@@ -159,10 +211,12 @@ async function main() {
     send(target, message);
     if (message.method === "turn/completed" && activeStreamSocket === target) {
       const threadId = message.params?.threadId ?? null;
-      if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
-        activeStreamSocket = null;
-        activeStreamThreadIds = null;
-        activeStreamTurn = null;
+      const turnId = message.params?.turn?.id ?? null;
+      // A completion of another turn on the same thread (for example a late one)
+      // does not end the current stream.
+      const otherTurn = Boolean(turnId && activeStreamTurn?.turnId && threadId === activeStreamTurn.threadId && turnId !== activeStreamTurn.turnId);
+      if (!otherTurn && (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId))) {
+        releaseStream();
         if (activeRequestSocket === target) {
           activeRequestSocket = null;
         }
@@ -174,9 +228,11 @@ async function main() {
   async function shutdown(server) {
     for (const socket of sockets) {
       socket.end();
+      // A peer that keeps its half open must not stall the shutdown.
+      setTimeout(() => socket.destroy(), SHUTDOWN_STEP_TIMEOUT_MS).unref?.();
     }
-    await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
+    await withLimit(appClient.close().catch(() => {}), SHUTDOWN_STEP_TIMEOUT_MS * 3);
+    await withLimit(new Promise((resolve) => server.close(resolve)), SHUTDOWN_STEP_TIMEOUT_MS);
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
     }
@@ -276,9 +332,9 @@ async function main() {
 
         try {
           const result = await upstream.request(message.method, message.params ?? {});
-          if (socket.destroyed) {
-            // The client left while the request ran; the reply has no reader.
-            return;
+          if (upstream !== appClient) {
+            // Answered by an app-server that was replaced meanwhile.
+            continue;
           }
           send(socket, { id: message.id, result });
           if (isStreaming) {
@@ -291,6 +347,16 @@ async function main() {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
+          if (socket.destroyed) {
+            // The client left while the request ran: nobody reads the reply. A
+            // turn it started is interrupted; otherwise ownership is released.
+            if (activeStreamSocket === socket && activeStreamTurn) {
+              abandonOrphanTurn();
+            } else {
+              clearSocketOwnership(socket);
+            }
+            return;
+          }
         } catch (error) {
           if (isRequestTimeoutError(error) && upstream === appClient) {
             // The app-server did not answer in time: it may be wedged (for example
@@ -301,16 +367,16 @@ async function main() {
               activeRequestSocket = null;
             }
             if (activeStreamSocket === socket) {
-              activeStreamSocket = null;
-              activeStreamThreadIds = null;
-              activeStreamTurn = null;
+              releaseStream();
             }
             await restartUpstreamIfIdle();
+            const upstreamRestarted = !restartReason && appClient !== upstream;
             send(socket, {
               id: message.id,
               error: buildJsonRpcError(
                 BROKER_UPSTREAM_TIMEOUT_RPC_CODE,
-                `${error.message}${restartReason ? " The shared broker will restart it once it is idle." : " The shared broker restarted it."}`
+                `${error.message}${upstreamRestarted ? " The shared broker restarted it." : " The shared broker will restart it once it is idle."}`,
+                { upstreamRestarted }
               )
             });
             continue;
@@ -323,7 +389,10 @@ async function main() {
             activeRequestSocket = null;
           }
           if (activeStreamSocket === socket && !isStreaming) {
-            activeStreamSocket = null;
+            releaseStream();
+          }
+          if (socket.destroyed) {
+            clearSocketOwnership(socket);
           }
         }
       }

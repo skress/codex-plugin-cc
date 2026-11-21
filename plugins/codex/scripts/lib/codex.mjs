@@ -619,7 +619,6 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   };
 
   client.setNotificationHandler((message) => {
-    armIdleTimer();
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
@@ -627,6 +626,10 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
     if (message.method === "thread/started" || message.method === "thread/name/updated") {
       applyTurnNotification(state, message);
+      const startedThreadId = message.params?.thread?.id ?? message.params?.threadId ?? null;
+      if (startedThreadId && state.threadIds.has(startedThreadId)) {
+        armIdleTimer();
+      }
       return;
     }
 
@@ -637,6 +640,9 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         return;
     }
 
+    // Only this turn's own events (its threads, including subagents) count as
+    // activity; events of other threads must not keep a quiet turn alive.
+    armIdleTimer();
     applyTurnNotification(state, message);
   });
 
@@ -845,7 +851,7 @@ async function resumeThread(client, threadId, cwd, options = {}) {
   } catch (error) {
     // The shared broker restarted its wedged app-server after this timeout; a
     // resume has no side effects, so one retry on the fresh app-server is safe.
-    if (error?.rpcCode === BROKER_UPSTREAM_TIMEOUT_RPC_CODE && !client.closed) {
+    if (error?.rpcCode === BROKER_UPSTREAM_TIMEOUT_RPC_CODE && error?.data?.data?.upstreamRestarted === true && !client.closed) {
       emitProgress(options.onProgress, `Codex did not answer the resume; retrying once on a restarted app-server.`, "starting");
       try {
         return await attempt(options);

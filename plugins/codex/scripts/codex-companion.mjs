@@ -25,7 +25,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, readProcessStartToken, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, isRecordedProcessGone, readProcessStartToken, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -1028,9 +1028,6 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
-
   const completedAt = nowIso();
   const nextJob = {
     ...job,
@@ -1041,6 +1038,8 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
+  // Record the cancellation before signalling: the job process's signal handler
+  // then finds the job no longer active and leaves it cancelled.
   writeJobFile(workspaceRoot, job.id, {
     ...existing,
     ...nextJob,
@@ -1054,6 +1053,14 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user.",
     completedAt
   });
+
+  // Checked after the interrupt above, right before signalling: never signal a
+  // pid that has exited or now belongs to another process.
+  const pidStartToken = existing.pidStartToken ?? job.pidStartToken ?? null;
+  if (!isRecordedProcessGone(job.pid, pidStartToken)) {
+    terminateProcessTree(job.pid ?? Number.NaN);
+  }
+  appendLogLine(job.logFile, "Cancelled by user.");
 
   const payload = {
     jobId: job.id,

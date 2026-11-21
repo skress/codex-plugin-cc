@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import test from "node:test";
@@ -8,9 +9,14 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
+import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
+import { ensureBrokerSession, sendBrokerShutdown } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { readProcessStartToken } from "../plugins/codex/scripts/lib/process.mjs";
 import { listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
+
+// Process start tokens are not available on Windows.
+const TOKENS = process.platform === "win32" ? { skip: "no process start tokens on Windows" } : {};
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "codex", "scripts", "codex-companion.mjs");
@@ -216,7 +222,7 @@ test("a running job whose process is gone no longer blocks its link key and show
   assert.match(stored.errorMessage, /exited before the job finished/);
 });
 
-test("a running job whose pid now belongs to another process is treated as dead", () => {
+test("a running job whose pid now belongs to another process is treated as dead", TOKENS, () => {
   const ctx = setupRepo();
   upsertJob(ctx.repo, {
     id: "task-reused",
@@ -255,7 +261,7 @@ test("a running job whose process is alive still blocks its link key", () => {
   assert.equal(listJobs(ctx.repo).find((job) => job.id === "task-alive").status, "running");
 });
 
-test("a job records the start token of its process", () => {
+test("a job records the start token of its process", TOKENS, () => {
   const ctx = setupRepo("turn-never-completes");
   const child = spawn("node", [SCRIPT, "task", "--link-key", "impl", "--json", "first round"], {
     cwd: ctx.repo,
@@ -312,12 +318,12 @@ test("a foreground task stopped by SIGTERM marks its job failed", async () => {
 });
 
 test("a late reply after a client-side timeout is ignored and the client keeps working", async () => {
-  const ctx = setupRepo("resume-hangs-once");
+  const ctx = setupRepo("resume-slow-once");
   linkThread(ctx, "impl");
   const client = await CodexAppServerClient.connect(ctx.repo, {
     disableBroker: true,
     env: ctx.env(),
-    requestTimeoutMs: 500
+    requestTimeoutMs: 300
   });
   try {
     await assert.rejects(
@@ -325,8 +331,12 @@ test("a late reply after a client-side timeout is ignored and the client keeps w
       (error) => error.code === "RPC_TIMEOUT" && /thread\/resume/.test(error.message)
     );
     assert.equal(client.pending.size, 0);
-    const response = await client.request("thread/resume", { threadId: "thr_1", cwd: ctx.repo });
+    // The fake answers the first resume after 800 ms; that reply must be dropped.
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    assert.equal(ctx.fakeState().resumeDelayConsumed, true);
+    const response = await client.request("thread/resume", { threadId: "thr_1", cwd: ctx.repo }, { timeoutMs: 5000 });
     assert.equal(response.thread.id, "thr_1");
+    assert.equal(client.pending.size, 0);
   } finally {
     await client.close();
   }
@@ -345,3 +355,209 @@ test("closing a client whose app-server ignores stdin end and SIGTERM still fini
   assert.notEqual(client.proc.exitCode === null && client.proc.signalCode === null, true);
 });
 
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+async function waitUntil(predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
+test("an app-server that never answers initialize is killed and connect fails", async () => {
+  const ctx = setupRepo("initialize-hangs");
+  const started = Date.now();
+  await assert.rejects(
+    CodexAppServerClient.connect(ctx.repo, { disableBroker: true, env: ctx.env(), requestTimeoutMs: 300, closeTimeoutMs: 300 }),
+    /initialize/
+  );
+  assert.ok(Date.now() - started < 5000);
+  const [pid] = ctx.fakeState().appServerPids;
+  assert.ok(await waitUntil(() => !isAlive(pid)), `app-server ${pid} still running`);
+});
+
+test("a direct app-server that closes its output fails pending requests at once", async () => {
+  const ctx = setupRepo("closes-stdout");
+  const client = await CodexAppServerClient.connect(ctx.repo, {
+    disableBroker: true,
+    env: ctx.env(),
+    requestTimeoutMs: 30000,
+    closeTimeoutMs: 300
+  });
+  const started = Date.now();
+  try {
+    await assert.rejects(client.request("thread/start", { cwd: ctx.repo }), /closed|exited/);
+    assert.ok(Date.now() - started < 5000, `took ${Date.now() - started} ms`);
+  } finally {
+    await client.close();
+  }
+});
+
+test("events of other threads do not keep a quiet turn alive", () => {
+  const ctx = setupRepo("turn-quiet-with-noise");
+
+  const result = task(ctx, ["--link-key", "impl", "--json", "first round"], { timeoutMs: 20000 });
+
+  assert.notEqual(result.error?.code, "ETIMEDOUT", "the idle limit never fired");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /No activity from Codex/);
+});
+
+function brokerSocket(endpoint) {
+  const socket = net.createConnection({ path: parseBrokerEndpoint(endpoint).path });
+  socket.setEncoding("utf8");
+  const messages = [];
+  let buffer = "";
+  socket.on("data", (chunk) => {
+    buffer += chunk;
+    let index;
+    while ((index = buffer.indexOf("\n")) !== -1) {
+      const line = buffer.slice(0, index);
+      buffer = buffer.slice(index + 1);
+      if (line.trim()) {
+        messages.push(JSON.parse(line));
+      }
+    }
+  });
+  socket.on("error", () => {});
+  let nextId = 1;
+  return {
+    socket,
+    messages,
+    connected: new Promise((resolve) => socket.on("connect", resolve)),
+    send(method, params = {}) {
+      const id = nextId++;
+      socket.write(`${JSON.stringify({ id, method, params })}\n`);
+      return id;
+    },
+    async reply(id, timeoutMs = 5000) {
+      assert.ok(await waitUntil(() => messages.some((message) => message.id === id), timeoutMs), `no reply to ${id}`);
+      return messages.find((message) => message.id === id);
+    }
+  };
+}
+
+async function startBroker(ctx) {
+  const env = ctx.env();
+  const session = await ensureBrokerSession(ctx.repo, { env });
+  assert.ok(session?.endpoint, "broker did not start");
+  return session.endpoint;
+}
+
+for (const when of ["before turn/start is acknowledged", "while its turn runs"]) {
+  test(`a client that disconnects ${when} gets its turn interrupted and leaks no events`, async () => {
+    const ctx = setupRepo(when.startsWith("before") ? "turn-start-slow-ack" : "turn-never-completes");
+    const endpoint = await startBroker(ctx);
+
+    const a = brokerSocket(endpoint);
+    await a.connected;
+    const started = await a.reply(a.send("thread/start", { cwd: ctx.repo }));
+    const threadA = started.result.thread.id;
+    const turnRequest = a.send("turn/start", { threadId: threadA, input: [{ type: "text", text: "go", text_elements: [] }] });
+    if (!when.startsWith("before")) {
+      await a.reply(turnRequest);
+    }
+    a.socket.destroy();
+
+    // Another client may only proceed once the orphaned turn is over.
+    const b = brokerSocket(endpoint);
+    await b.connected;
+    let answer;
+    const deadline = Date.now() + 8000;
+    do {
+      answer = await b.reply(b.send("thread/list", {}));
+      if (answer.error?.code !== BROKER_BUSY_RPC_CODE) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } while (Date.now() < deadline);
+
+    assert.equal(answer.error, undefined, JSON.stringify(answer.error));
+    assert.equal(ctx.fakeState().lastInterrupt?.threadId, threadA);
+    const leaked = b.messages.filter((message) => message.method && message.params?.threadId === threadA);
+    assert.deepEqual(leaked, []);
+    b.socket.destroy();
+    await sendBrokerShutdown(endpoint);
+  });
+}
+
+test("a broker shutdown request to a silent endpoint returns within its limit", async () => {
+  const dir = makeTempDir();
+  const socketPath = path.join(dir, "silent.sock");
+  const held = [];
+  const server = net.createServer((socket) => held.push(socket));
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    const started = Date.now();
+    await sendBrokerShutdown(`unix:${socketPath}`, { timeoutMs: 300 });
+    assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms`);
+  } finally {
+    for (const socket of held) {
+      socket.destroy();
+    }
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+function recordForeignRunningJob(ctx, pid, extra = {}) {
+  upsertJob(ctx.repo, {
+    id: "task-foreign",
+    kind: "task",
+    jobClass: "task",
+    status: "running",
+    sessionId: "sess-a",
+    pid,
+    pidStartToken: "not-the-start-of-this-process",
+    ...extra
+  });
+}
+
+function spawnSleeper() {
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  sleeper.unref();
+  return sleeper;
+}
+
+test("cancel does not signal a process that reused a job's pid", TOKENS, async (t) => {
+  const ctx = setupRepo();
+  const sleeper = spawnSleeper();
+  t.after(() => sleeper.kill("SIGKILL"));
+  recordForeignRunningJob(ctx, sleeper.pid);
+
+  const result = run("node", [SCRIPT, "cancel", "task-foreign", "--json"], { cwd: ctx.repo, env: ctx.env() });
+
+  assert.equal(result.status, 0, result.stderr);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(isAlive(sleeper.pid), true, "cancel killed an unrelated process");
+  assert.equal(listJobs(ctx.repo).find((job) => job.id === "task-foreign").status, "cancelled");
+});
+
+test("SessionEnd does not signal a process that reused a job's pid", TOKENS, async (t) => {
+  const ctx = setupRepo();
+  const sleeper = spawnSleeper();
+  t.after(() => sleeper.kill("SIGKILL"));
+  recordForeignRunningJob(ctx, sleeper.pid);
+
+  const result = run("node", [path.join(ROOT, "plugins", "codex", "scripts", "session-lifecycle-hook.mjs"), "SessionEnd"], {
+    cwd: ctx.repo,
+    env: ctx.env(),
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-a", cwd: ctx.repo })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(isAlive(sleeper.pid), true, "SessionEnd killed an unrelated process");
+  assert.equal(listJobs(ctx.repo).some((job) => job.id === "task-foreign"), false);
+});

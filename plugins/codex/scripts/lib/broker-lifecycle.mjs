@@ -40,19 +40,31 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
-export async function sendBrokerShutdown(endpoint) {
+// Bounded: a broker that does not answer must not use up the SessionEnd hook's
+// time budget before the session's jobs are cleaned up.
+export async function sendBrokerShutdown(endpoint, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 1500;
   await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
+    const timer = setTimeout(() => {
+      socket.destroy();
+      resolve();
+    }, timeoutMs);
+    timer.unref?.();
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
     socket.on("data", () => {
       socket.end();
-      resolve();
+      done();
     });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
+    socket.on("error", done);
+    socket.on("close", done);
   });
 }
 

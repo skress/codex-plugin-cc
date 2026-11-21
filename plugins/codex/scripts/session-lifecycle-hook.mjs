@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { terminateProcessTree } from "./lib/process.mjs";
+import { isRecordedProcessGone, terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
@@ -56,9 +56,17 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
+  // Remove the jobs first: a job process that handles the signal below then finds
+  // no record to update and cannot bring the removed entries back.
+  saveState(workspaceRoot, {
+    ...state,
+    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+  });
+
   for (const job of removedJobs) {
     const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
+    // Never signal a pid that now belongs to another process.
+    if (!stillRunning || isRecordedProcessGone(job.pid, job.pidStartToken ?? null)) {
       continue;
     }
     try {
@@ -67,11 +75,6 @@ function cleanupSessionJobs(cwd, sessionId) {
       // Ignore teardown failures during session shutdown.
     }
   }
-
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-  });
 }
 
 function handleSessionStart(input) {

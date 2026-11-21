@@ -277,6 +277,7 @@ if (BEHAVIOR === "ignores-shutdown") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];
 saveState(bootState);
 
 const rl = readline.createInterface({ input: process.stdin });
@@ -291,6 +292,9 @@ rl.on("line", (line) => {
   try {
     switch (message.method) {
       case "initialize":
+        if (BEHAVIOR === "initialize-hangs") {
+          break;
+        }
         state.capabilities = message.params.capabilities || null;
         saveState(state);
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
@@ -311,6 +315,12 @@ rl.on("line", (line) => {
         break;
 
       case "thread/start": {
+        if (BEHAVIOR === "closes-stdout") {
+          // The protocol stream ends while the process keeps running.
+          process.stdout.end();
+          setInterval(() => {}, 1000);
+          break;
+        }
         if (BEHAVIOR === "auth-run-fails") {
           throw new Error("authentication expired; run codex login");
         }
@@ -369,6 +379,14 @@ rl.on("line", (line) => {
         thread.updatedAt = now();
         saveState(state);
         const resumed = buildThread(thread);
+        const resumeReply = { id: message.id, result: { thread: resumed, model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } };
+        if (BEHAVIOR === "resume-slow-once" && !state.resumeDelayConsumed) {
+          // The first resume is answered, but late.
+          state.resumeDelayConsumed = true;
+          saveState(state);
+          setTimeout(() => send(resumeReply), 800);
+          break;
+        }
         if (BEHAVIOR === "resume-large-reply" && !message.params.excludeTurns) {
           // A big history reply that reaches the client in many chunks.
           const bigText = "x".repeat(64 * 1024);
@@ -489,7 +507,26 @@ rl.on("line", (line) => {
 	        if (BEHAVIOR === "turn-start-hangs") {
 	          break;
 	        }
+	        if (BEHAVIOR === "turn-start-slow-ack") {
+	          // Acknowledge late, then run until interrupted.
+	          interruptibleTurns.set(turnId, { threadId: thread.id, timer: null });
+	          setTimeout(() => {
+	            send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	            send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          }, 400);
+	          break;
+	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+	        if (BEHAVIOR === "turn-quiet-with-noise") {
+	          // The turn goes quiet, but events of another thread keep arriving.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          interruptibleTurns.set(turnId, { threadId: thread.id, timer: null });
+	          setInterval(() => {
+	            send({ method: "item/completed", params: { threadId: "thr_unrelated", turnId: "turn_unrelated", item: { type: "agentMessage", id: "msg_noise", text: "noise", phase: "analysis" } } });
+	          }, 200);
+	          break;
+	        }
 
 	        if (BEHAVIOR === "turn-never-completes") {
 	          // Acknowledge the turn and go quiet; only turn/interrupt ends it.
