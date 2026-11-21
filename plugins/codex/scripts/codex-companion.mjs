@@ -25,7 +25,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, isRecordedProcessGone, readProcessStartToken, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, shouldSignalRecordedProcess, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -51,6 +51,7 @@ import {
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
+  adoptTerminalJobFile,
   nowIso,
   reconcileDeadJobs,
   runTrackedJob,
@@ -732,8 +733,9 @@ function enqueueBackgroundTask(cwd, job, request) {
     ...job,
     status: "queued",
     phase: "queued",
+    // No start token here: reading it takes time while the worker already looks
+    // for this record. The worker records its own token when it starts running.
     pid: child.pid ?? null,
-    pidStartToken: child.pid ? readProcessStartToken(child.pid) : null,
     logFile,
     request
   };
@@ -1030,9 +1032,12 @@ async function handleCancel(argv) {
 
   // The interrupt above took time: the job may have finished meanwhile. Its own
   // outcome then stands.
+  // The job file counts too: a run that wrote its outcome there and died before
+  // updating the index has finished; reconciliation carries that outcome over.
+  const storedOutcome = adoptTerminalJobFile(workspaceRoot, job.id);
   const current = listJobs(workspaceRoot).find((entry) => entry.id === job.id);
-  if (!current || (current.status !== "queued" && current.status !== "running")) {
-    const finishedStatus = current?.status ?? "removed";
+  if (storedOutcome || !current || (current.status !== "queued" && current.status !== "running")) {
+    const finishedStatus = storedOutcome ?? current?.status ?? "removed";
     outputCommandResult(
       { jobId: job.id, status: finishedStatus, title: job.title, turnInterruptAttempted: interrupt.attempted, turnInterrupted: interrupt.interrupted },
       `Job ${job.id} already finished (${finishedStatus}); nothing to cancel.\n`,
@@ -1070,7 +1075,7 @@ async function handleCancel(argv) {
   // Checked after the interrupt above, right before signalling: never signal a
   // pid that has exited or now belongs to another process.
   const pidStartToken = existing.pidStartToken ?? job.pidStartToken ?? null;
-  if (!isRecordedProcessGone(job.pid, pidStartToken)) {
+  if (shouldSignalRecordedProcess(job.pid, pidStartToken)) {
     terminateProcessTree(job.pid ?? Number.NaN);
   }
   appendLogLine(job.logFile, "Cancelled by user.");

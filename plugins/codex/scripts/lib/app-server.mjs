@@ -40,7 +40,8 @@ export const DEFAULT_TURN_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 export const DEFAULT_CLOSE_TIMEOUT_MS = 10 * 1000;
 // Through the broker the companion waits a little longer than the broker waits for
 // its app-server, so the broker's answer (and its restart) arrives first.
-const BROKER_CLIENT_GRACE_MS = 30 * 1000;
+// Longer than the broker's bounded wait for a restart before it answers (15 s).
+const BROKER_CLIENT_GRACE_MS = 20 * 1000;
 const SIGKILL_WAIT_MS = 2000;
 
 export function resolveTimeoutMs(envName, fallback, env = process.env) {
@@ -276,6 +277,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
       windowsHide: true
     });
+    this.options.onSpawn?.(this.proc);
 
     // Settles when the process itself is gone (exit, or it never started),
     // which can be later than the protocol connection ending.
@@ -406,7 +408,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     this.transport = "broker";
     this.endpoint = options.brokerEndpoint;
     if (options.requestTimeoutMs === undefined) {
-      this.requestTimeoutMs += Math.min(BROKER_CLIENT_GRACE_MS, this.requestTimeoutMs);
+      this.requestTimeoutMs += BROKER_CLIENT_GRACE_MS;
     }
   }
 
@@ -414,6 +416,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     await new Promise((resolve, reject) => {
       const target = parseBrokerEndpoint(this.endpoint);
       this.socket = net.createConnection({ path: target.path });
+      this.socketClosed = new Promise((resolveClosed) => this.socket.once("close", resolveClosed));
       this.socket.setEncoding("utf8");
       this.socket.on("connect", resolve);
       this.socket.on("data", (chunk) => {
@@ -446,10 +449,12 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     this.closed = true;
     if (this.socket) {
       this.socket.end();
-    }
-    if (!(await waitWithLimit(this.exitPromise, this.closeTimeoutMs))) {
-      this.socket?.destroy();
-      await waitWithLimit(this.exitPromise, Math.min(SIGKILL_WAIT_MS, this.closeTimeoutMs));
+      // Wait for the socket itself: the connection may have failed already (for
+      // example on invalid JSON) while the socket is still open.
+      if (!(await waitWithLimit(this.socketClosed, this.closeTimeoutMs))) {
+        this.socket.destroy();
+        await waitWithLimit(this.socketClosed, Math.min(SIGKILL_WAIT_MS, this.closeTimeoutMs));
+      }
     }
     this.handleExit(null);
   }

@@ -555,7 +555,7 @@ rl.on("line", (line) => {
 	          break;
 	        }
 
-	        if (BEHAVIOR === "turn-never-completes") {
+	        if (BEHAVIOR === "turn-never-completes" || BEHAVIOR === "turn-never-completes-interrupt-fails") {
 	          // Acknowledge the turn and go quiet; only turn/interrupt ends it.
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer: null });
@@ -729,7 +729,13 @@ rl.on("line", (line) => {
 	          threadId: message.params.threadId,
 	          turnId: message.params.turnId
 	        };
+	        state.interruptRequests = (state.interruptRequests || 0) + 1;
 	        saveState(state);
+	        if (BEHAVIOR === "turn-never-completes-interrupt-fails") {
+	          // The interrupt is refused and the turn keeps running.
+	          send({ id: message.id, error: { code: -32000, message: "interrupt refused" } });
+	          break;
+	        }
 	        const pending = interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
 	          clearTimeout(pending.timer);

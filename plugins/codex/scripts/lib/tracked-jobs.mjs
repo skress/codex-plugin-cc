@@ -101,7 +101,15 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
+    // Progress only updates a job that is still active: it never recreates a
+    // record SessionEnd removed, nor changes one that was cancelled or finished.
+    const state = loadState(workspaceRoot);
+    const current = state.jobs.find((job) => job.id === jobId);
+    if (!current || !isActiveStatus(current.status)) {
+      return;
+    }
+    Object.assign(current, patch, { updatedAt: nowIso() });
+    saveState(workspaceRoot, state);
 
     const jobFile = resolveJobFile(workspaceRoot, jobId);
     if (!fs.existsSync(jobFile)) {
@@ -195,6 +203,37 @@ export function failActiveJob(workspaceRoot, jobId, errorMessage, options = {}) 
     // The log is informational.
   }
   return true;
+}
+
+// When a job's file already holds the run's outcome but the index still says
+// active (the run is between its two writes, or died there), the index takes the
+// file's outcome. Returns the file's status, or null when the file is not terminal.
+export function adoptTerminalJobFile(workspaceRoot, jobId) {
+  let stored = null;
+  try {
+    stored = readStoredJobOrNull(workspaceRoot, jobId);
+  } catch {
+    return null;
+  }
+  if (!stored?.status || isActiveStatus(stored.status)) {
+    return null;
+  }
+  const state = loadState(workspaceRoot);
+  const current = state.jobs.find((job) => job.id === jobId);
+  if (current && isActiveStatus(current.status)) {
+    Object.assign(current, {
+      status: stored.status,
+      phase: stored.phase ?? (stored.status === "completed" ? "done" : stored.status),
+      pid: null,
+      threadId: stored.threadId ?? current.threadId ?? null,
+      turnId: stored.turnId ?? current.turnId ?? null,
+      errorMessage: stored.errorMessage ?? null,
+      completedAt: stored.completedAt ?? nowIso(),
+      updatedAt: nowIso()
+    });
+    saveState(workspaceRoot, state);
+  }
+  return stored.status;
 }
 
 // A queued or running job whose recorded process is gone (exited, killed, or its

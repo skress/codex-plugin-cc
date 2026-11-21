@@ -6,7 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { isRecordedProcessGone, readProcessStartToken } from "./process.mjs";
+import { readProcessStartToken, shouldSignalRecordedProcess } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -188,7 +188,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
 
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, pidStartToken = null, killProcess = null }) {
   // Never signal a broker pid that has exited or now belongs to another process.
-  if (Number.isFinite(pid) && killProcess && !isRecordedProcessGone(pid, pidStartToken)) {
+  if (Number.isFinite(pid) && killProcess && shouldSignalRecordedProcess(pid, pidStartToken)) {
     try {
       killProcess(pid);
     } catch {

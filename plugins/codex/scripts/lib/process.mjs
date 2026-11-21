@@ -133,11 +133,12 @@ export function formatCommandFailure(result) {
   return parts.join(": ");
 }
 
-// A token that identifies one process incarnation: the same pid with a different
-// token is a different (reused) process. Linux: start time in clock ticks from
-// /proc/<pid>/stat. Elsewhere (macOS, BSD): `ps -o lstart=`. null when unknown
-// (Windows, ps missing, process gone); callers then rely on the pid alone.
-export function readProcessStartToken(pid, options = {}) {
+// Identity of a running process: a start token (the same pid with a different
+// token is a different, reused process) and whether it is a zombie (exited, not
+// reaped yet; it still answers kill(pid, 0)). Linux: /proc/<pid>/stat. Elsewhere
+// (macOS, BSD): `ps -o stat= -o lstart=`. null when unknown (Windows, ps missing
+// or not permitted, process gone).
+export function readProcessIdentity(pid, options = {}) {
   if (!Number.isInteger(pid) || pid <= 0) {
     return null;
   }
@@ -149,21 +150,29 @@ export function readProcessStartToken(pid, options = {}) {
     try {
       const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
       // The command name (field 2) may contain spaces and parentheses; fields after
-      // the last ")" are fixed. starttime is field 22, i.e. index 19 after it.
+      // the last ")" are fixed: state is field 3, starttime field 22.
       const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-      return fields[19] ? `linux:${fields[19]}` : null;
+      return fields[19] ? { token: `linux:${fields[19]}`, zombie: fields[0] === "Z" || fields[0] === "X" } : null;
     } catch {
       return null;
     }
   }
-  const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+  const result = spawnSync("ps", ["-o", "stat=", "-o", "lstart=", "-p", String(pid)], {
     encoding: "utf8",
     env: { ...process.env, LC_ALL: "C" },
     timeout: 5000,
     windowsHide: true
   });
-  const started = String(result.stdout ?? "").trim().replace(/\s+/g, " ");
-  return result.status === 0 && started ? `ps:${started}` : null;
+  const line = String(result.stdout ?? "").trim().replace(/\s+/g, " ");
+  const match = /^(\S+) (.+)$/.exec(line);
+  if (result.status !== 0 || !match) {
+    return null;
+  }
+  return { token: `ps:${match[2]}`, zombie: match[1].startsWith("Z") };
+}
+
+export function readProcessStartToken(pid, options = {}) {
+  return readProcessIdentity(pid, options)?.token ?? null;
 }
 
 // "alive", "dead", or "unknown" (no permission to signal it, or no pid).
@@ -183,7 +192,7 @@ export function probeProcess(pid, options = {}) {
   }
 }
 
-// A recorded process is gone when its pid no longer exists, or when the pid now
+// A recorded process is gone when its pid no longer exists, is a zombie, or now
 // belongs to a process with a different start token (pid reuse). Unknown stays
 // "not gone", so a job is never failed on a guess.
 export function isRecordedProcessGone(pid, startToken = null, options = {}) {
@@ -191,9 +200,27 @@ export function isRecordedProcessGone(pid, startToken = null, options = {}) {
   if (state === "dead") {
     return true;
   }
-  if (state !== "alive" || !startToken) {
+  if (state !== "alive") {
     return false;
   }
+  const identity = (options.readIdentity ?? readProcessIdentity)(pid);
+  if (identity?.zombie) {
+    return true;
+  }
+  return Boolean(startToken && identity?.token && identity.token !== startToken);
+}
+
+// Whether a recorded process may be signalled: it is alive and, when a start
+// token was recorded, the current token was read and matches. A pid whose
+// identity cannot be checked now is left alone. Without a recorded token (Windows,
+// records from older versions) the pid alone decides, as before.
+export function shouldSignalRecordedProcess(pid, startToken = null, options = {}) {
+  if (probeProcess(pid, options) !== "alive") {
+    return false;
+  }
+  if (!startToken) {
+    return true;
+  }
   const current = (options.readStartToken ?? readProcessStartToken)(pid);
-  return current !== null && current !== startToken;
+  return current !== null && current === startToken;
 }

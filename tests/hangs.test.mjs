@@ -12,7 +12,11 @@ import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { ensureBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
-import { readProcessStartToken, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import * as processLib from "../plugins/codex/scripts/lib/process.mjs";
+import { createJobProgressUpdater } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+
+const { isRecordedProcessGone, readProcessStartToken, terminateProcessTree } = processLib;
+const shouldSignalRecordedProcess = processLib.shouldSignalRecordedProcess ?? (() => { throw new Error("shouldSignalRecordedProcess is missing"); });
 import { listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 
 // Process start tokens are not available on Windows.
@@ -721,4 +725,104 @@ test("a broker shutdown request returns and lets go of a peer that answers and s
     }
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("a refused idle interrupt does not release the turn: the broker replaces the app-server once its client left", async () => {
+  const ctx = setupRepo("turn-never-completes-interrupt-fails");
+
+  const result = task(ctx, ["--link-key", "impl", "--json", "first round"], { timeoutMs: 30000 });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /No activity from Codex/);
+  // The companion left with its turn still running: the broker must treat it as
+  // an orphan (interrupt again, refused, then replace the app-server) instead of
+  // handing the live turn's events to the next client.
+  assert.ok(await waitUntil(() => ctx.fakeState().appServerStarts >= 2, 8000), "the broker kept the app-server with the live orphaned turn");
+});
+
+test("a process that exited but was not reaped yet counts as gone", { skip: process.platform === "win32" ? "no zombies on Windows" : false }, async () => {
+  // sh starts a short child, then becomes a sleep that never reaps it.
+  const holder = spawn("sh", ["-c", "sleep 0 & echo $!; exec sleep 5"], { stdio: ["ignore", "pipe", "ignore"] });
+  const zombiePid = Number(await new Promise((resolve) => holder.stdout.once("data", (chunk) => resolve(String(chunk).trim()))));
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(isAlive(zombiePid), true, "test setup: the zombie should still answer kill(pid, 0)");
+    assert.equal(isRecordedProcessGone(zombiePid, null), true);
+  } finally {
+    holder.kill("SIGKILL");
+  }
+});
+
+test("a recorded pid whose identity cannot be checked now is not signalled", () => {
+  assert.equal(shouldSignalRecordedProcess(process.pid, "recorded-token", { readStartToken: () => null }), false);
+  assert.equal(shouldSignalRecordedProcess(process.pid, "recorded-token", { readStartToken: () => "recorded-token" }), true);
+  assert.equal(shouldSignalRecordedProcess(process.pid, "recorded-token", { readStartToken: () => "other" }), false);
+  // No token was ever recorded (Windows, older records): the pid alone decides, as before.
+  assert.equal(shouldSignalRecordedProcess(process.pid, null, { readStartToken: () => null }), true);
+  assert.equal(shouldSignalRecordedProcess(deadPid(), null), false);
+});
+
+test("closing a broker client whose connection already failed still lets go of the socket", async () => {
+  const dir = makeTempDir();
+  const socketPath = path.join(dir, "bad-broker.sock");
+  const held = [];
+  const server = net.createServer({ allowHalfOpen: true }, (socket) => {
+    held.push(socket);
+    socket.on("data", (chunk) => {
+      for (const line of String(chunk).split("\n").filter(Boolean)) {
+        const message = JSON.parse(line);
+        if (message.method === "initialize") {
+          socket.write(`${JSON.stringify({ id: message.id, result: {} })}\n`);
+          // Then garbage: the client gives up on the connection.
+          setTimeout(() => socket.write("not json\n"), 50);
+        }
+      }
+    });
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    const started = Date.now();
+    const child = spawn("node", ["--input-type=module", "-e", `
+      const { CodexAppServerClient } = await import(${APP_SERVER_MODULE});
+      const client = await CodexAppServerClient.connect(process.cwd(), { brokerEndpoint: process.argv[1], closeTimeoutMs: 300 });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await client.close();
+    `, `unix:${socketPath}`], { stdio: "ignore" });
+    const exited = await Promise.race([
+      new Promise((resolve) => child.on("exit", () => resolve(true))),
+      new Promise((resolve) => setTimeout(() => resolve(false), 4000))
+    ]);
+    child.kill("SIGKILL");
+    assert.ok(exited, `the client was still running after ${Date.now() - started} ms`);
+  } finally {
+    for (const socket of held) {
+      socket.destroy();
+    }
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("a progress event does not recreate a job record that was removed", () => {
+  const ctx = setupRepo();
+  const update = createJobProgressUpdater(ctx.repo, "task-removed");
+
+  update({ message: "Thread ready.", phase: "starting", threadId: "thr_1" });
+
+  assert.deepEqual(listJobs(ctx.repo), []);
+});
+
+test("cancel leaves a job alone whose job file already holds its outcome", TOKENS, async (t) => {
+  const ctx = setupRepo();
+  const sleeper = spawnSleeper();
+  t.after(() => sleeper.kill("SIGKILL"));
+  upsertJob(ctx.repo, { id: "task-finished", kind: "task", jobClass: "task", status: "running", sessionId: "sess-a", pid: sleeper.pid, pidStartToken: readProcessStartToken(sleeper.pid) });
+  writeJobFile(ctx.repo, "task-finished", { id: "task-finished", status: "completed", phase: "done", threadId: "thr_7", result: { status: 0 } });
+
+  const result = run("node", [SCRIPT, "cancel", "task-finished", "--json"], { cwd: ctx.repo, env: ctx.env() });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readJobFile(resolveJobFile(ctx.repo, "task-finished")).status, "completed");
+  assert.equal(listJobs(ctx.repo).find((job) => job.id === "task-finished").status, "completed");
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(isAlive(sleeper.pid), true, "cancel signalled the process of a finished job");
 });

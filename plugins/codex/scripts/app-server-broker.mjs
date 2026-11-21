@@ -90,6 +90,18 @@ async function main() {
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
   writePidFile(pidFile);
 
+  // Every app-server this broker started and has not seen exit, including one
+  // still initializing; none may outlive the broker.
+  const upstreamProcesses = new Set();
+  process.on("exit", () => {
+    for (const child of upstreamProcesses) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+  });
   let appClient = await connectUpstream();
   let activeRequestSocket = null;
   let activeStreamSocket = null;
@@ -115,7 +127,11 @@ async function main() {
   async function connectUpstream() {
     const client = await CodexAppServerClient.connect(cwd, {
       disableBroker: true,
-      closeTimeoutMs: UPSTREAM_CLOSE_TIMEOUT_MS
+      closeTimeoutMs: UPSTREAM_CLOSE_TIMEOUT_MS,
+      onSpawn(child) {
+        upstreamProcesses.add(child);
+        child.once("exit", () => upstreamProcesses.delete(child));
+      }
     });
     client.setNotificationHandler((message) => routeNotification(message));
     client.exitPromise.then(() => {
@@ -324,6 +340,11 @@ async function main() {
         if (!isOwned() && restartReason) {
           await restartUpstreamIfIdle();
         }
+        if (socket.destroyed || shuttingDown) {
+          // The client left (or the broker is stopping) while this request waited
+          // for a restart: never start work nobody will read.
+          return;
+        }
 
         if (
           (((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
@@ -424,9 +445,9 @@ async function main() {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
-          if (activeStreamSocket === socket && !isStreaming) {
-            releaseStream();
-          }
+          // A failed request (for example a refused turn/interrupt) does not end
+          // the client's running turn: the stream stays owned until turn/completed
+          // or the client leaves (then the orphan handling takes over).
           if (socket.destroyed) {
             clearSocketOwnership(socket);
           }

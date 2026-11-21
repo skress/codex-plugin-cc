@@ -58,6 +58,8 @@ export interface CodexAppServerClientOptions {
   requestTimeoutMs?: number;
   /** Limit for close(); defaults to CODEX_COMPANION_CLOSE_TIMEOUT_MS or ten seconds. */
   closeTimeoutMs?: number;
+  /** Called with the spawned app-server process (direct transport only). */
+  onSpawn?: (child: import("node:child_process").ChildProcess) => void;
 }
 
 export interface AppServerMethodMap {

@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { isRecordedProcessGone, terminateProcessTree } from "./lib/process.mjs";
+import { shouldSignalRecordedProcess, terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
@@ -66,7 +66,7 @@ function cleanupSessionJobs(cwd, sessionId) {
   for (const job of removedJobs) {
     const stillRunning = job.status === "queued" || job.status === "running";
     // Never signal a pid that now belongs to another process.
-    if (!stillRunning || isRecordedProcessGone(job.pid, job.pidStartToken ?? null)) {
+    if (!stillRunning || !shouldSignalRecordedProcess(job.pid, job.pidStartToken ?? null)) {
       continue;
     }
     try {
