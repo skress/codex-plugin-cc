@@ -25,7 +25,7 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, shouldSignalRecordedProcess, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -51,7 +51,10 @@ import {
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
+  adoptTerminalJobFile,
   nowIso,
+  recordQueuedStartToken,
+  reconcileDeadJobs,
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
@@ -347,6 +350,8 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
+  // A job whose process died (killed client, crash) must not block the key forever.
+  reconcileDeadJobs(workspaceRoot);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const linkKey = options.linkKey ?? null;
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
@@ -735,6 +740,10 @@ function enqueueBackgroundTask(cwd, job, request) {
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+  // The record exists before the (slower) token lookup, so the worker finds it;
+  // the token then guards cancel and SessionEnd against pid reuse even if the
+  // worker dies before it records its own.
+  recordQueuedStartToken(job.workspaceRoot, job.id, child.pid ?? null);
 
   return {
     payload: {
@@ -904,6 +913,11 @@ async function handleTaskWorker(argv) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
   }
 
+  if (storedJob.status !== "queued") {
+    // Cancelled (or otherwise settled) before this worker got to it.
+    return;
+  }
+
   const request = storedJob.request;
   if (!request || typeof request !== "object") {
     throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
@@ -1024,8 +1038,21 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
+  // The interrupt above took time: the job may have finished meanwhile. Its own
+  // outcome then stands.
+  // The job file counts too: a run that wrote its outcome there and died before
+  // updating the index has finished; reconciliation carries that outcome over.
+  const storedOutcome = adoptTerminalJobFile(workspaceRoot, job.id);
+  const current = listJobs(workspaceRoot).find((entry) => entry.id === job.id);
+  if (storedOutcome || !current || (current.status !== "queued" && current.status !== "running")) {
+    const finishedStatus = storedOutcome ?? current?.status ?? "removed";
+    outputCommandResult(
+      { jobId: job.id, status: finishedStatus, title: job.title, turnInterruptAttempted: interrupt.attempted, turnInterrupted: interrupt.interrupted },
+      `Job ${job.id} already finished (${finishedStatus}); nothing to cancel.\n`,
+      options.json
+    );
+    return;
+  }
 
   const completedAt = nowIso();
   const nextJob = {
@@ -1037,6 +1064,8 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
+  // Record the cancellation before signalling: the job process's signal handler
+  // then finds the job no longer active and leaves it cancelled.
   writeJobFile(workspaceRoot, job.id, {
     ...existing,
     ...nextJob,
@@ -1050,6 +1079,14 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user.",
     completedAt
   });
+
+  // Checked after the interrupt above, right before signalling: never signal a
+  // pid that has exited or now belongs to another process.
+  const pidStartToken = existing.pidStartToken ?? job.pidStartToken ?? null;
+  if (shouldSignalRecordedProcess(job.pid, pidStartToken)) {
+    terminateProcessTree(job.pid ?? Number.NaN);
+  }
+  appendLogLine(job.logFile, "Cancelled by user.");
 
   const payload = {
     jobId: job.id,

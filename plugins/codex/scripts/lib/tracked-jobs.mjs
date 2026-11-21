@@ -1,7 +1,9 @@
 import fs from "node:fs";
+import os from "node:os";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { isRecordedProcessGone, readProcessStartToken } from "./process.mjs";
+import { listJobs, loadState, readJobFile, resolveJobFile, resolveJobLogFile, saveState, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -99,7 +101,15 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
+    // Progress only updates a job that is still active: it never recreates a
+    // record SessionEnd removed, nor changes one that was cancelled or finished.
+    const state = loadState(workspaceRoot);
+    const current = state.jobs.find((job) => job.id === jobId);
+    if (!current || !isActiveStatus(current.status)) {
+      return;
+    }
+    Object.assign(current, patch, { updatedAt: nowIso() });
+    saveState(workspaceRoot, state);
 
     const jobFile = resolveJobFile(workspaceRoot, jobId);
     if (!fs.existsSync(jobFile)) {
@@ -131,6 +141,198 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   };
 }
 
+function isActiveStatus(status) {
+  return status === "queued" || status === "running";
+}
+
+// Marks a job failed only while it is still active (and, with expectedPid, still
+// owned by that process), in both the state index and the job file. A job that
+// finished, was cancelled or was removed meanwhile is left alone. Returns whether
+// the index entry changed.
+//
+// The job store has no lock (see docs/handover.md), so this narrows rather than
+// closes the races: the state is re-read right before each write, nothing is
+// written when the job is no longer active, and the job file is written before
+// the index, so a crash in between leaves the index active and a later
+// reconciliation finishes the job file and the index together.
+export function failActiveJob(workspaceRoot, jobId, errorMessage, options = {}) {
+  const isOurs = (job) =>
+    job && isActiveStatus(job.status) && (options.expectedPid === undefined || job.pid === options.expectedPid);
+  const indexed = listJobs(workspaceRoot).find((job) => job.id === jobId);
+  if (!isOurs(indexed)) {
+    return false;
+  }
+  const completedAt = nowIso();
+  let logFile = indexed.logFile ?? null;
+  // What the index gets: failed, unless the job file already holds the run's own
+  // outcome (the process died between writing the job file and the index).
+  let indexPatch = { status: "failed", phase: "failed", pid: null, errorMessage, completedAt };
+  const jobFile = resolveJobFile(workspaceRoot, jobId);
+  let stored = null;
+  try {
+    stored = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
+  } catch {
+    stored = null;
+  }
+  if (stored && stored.status && !isActiveStatus(stored.status)) {
+    indexPatch = {
+      status: stored.status,
+      phase: stored.phase ?? (stored.status === "completed" ? "done" : stored.status),
+      pid: null,
+      threadId: stored.threadId ?? indexed.threadId ?? null,
+      turnId: stored.turnId ?? indexed.turnId ?? null,
+      errorMessage: stored.errorMessage ?? null,
+      completedAt: stored.completedAt ?? completedAt
+    };
+  } else {
+    // An active, missing or unreadable job file is replaced by a failed record, so
+    // the index and the job file agree.
+    writeJobFile(workspaceRoot, jobId, { ...(stored ?? indexed), status: "failed", phase: "failed", pid: null, errorMessage, completedAt });
+    logFile = logFile ?? stored?.logFile ?? null;
+  }
+  const state = loadState(workspaceRoot);
+  const current = state.jobs.find((job) => job.id === jobId);
+  if (!isOurs(current)) {
+    return false;
+  }
+  Object.assign(current, indexPatch, { updatedAt: completedAt });
+  saveState(workspaceRoot, state);
+  try {
+    appendLogLine(logFile, errorMessage);
+  } catch {
+    // The log is informational.
+  }
+  return true;
+}
+
+// Adds the start token of a queued job's worker, only while the job is still
+// queued with that pid (the worker may already have taken over).
+export function recordQueuedStartToken(workspaceRoot, jobId, pid) {
+  const pidStartToken = readProcessStartToken(pid);
+  if (!pidStartToken) {
+    return;
+  }
+  const state = loadState(workspaceRoot);
+  const current = state.jobs.find((job) => job.id === jobId);
+  if (!current || current.status !== "queued" || current.pid !== pid || current.pidStartToken) {
+    return;
+  }
+  current.pidStartToken = pidStartToken;
+  saveState(workspaceRoot, state);
+  const stored = readStoredJobOrNull(workspaceRoot, jobId);
+  if (stored && stored.status === "queued" && stored.pid === pid && !stored.pidStartToken) {
+    writeJobFile(workspaceRoot, jobId, { ...stored, pidStartToken });
+  }
+}
+
+// When a job's file already holds the run's outcome but the index still says
+// active (the run is between its two writes, or died there), the index takes the
+// file's outcome. Returns the file's status, or null when the file is not terminal.
+export function adoptTerminalJobFile(workspaceRoot, jobId) {
+  let stored = null;
+  try {
+    stored = readStoredJobOrNull(workspaceRoot, jobId);
+  } catch {
+    return null;
+  }
+  if (!stored?.status || isActiveStatus(stored.status)) {
+    return null;
+  }
+  const state = loadState(workspaceRoot);
+  const current = state.jobs.find((job) => job.id === jobId);
+  if (current && isActiveStatus(current.status)) {
+    Object.assign(current, {
+      status: stored.status,
+      phase: stored.phase ?? (stored.status === "completed" ? "done" : stored.status),
+      pid: null,
+      threadId: stored.threadId ?? current.threadId ?? null,
+      turnId: stored.turnId ?? current.turnId ?? null,
+      errorMessage: stored.errorMessage ?? null,
+      completedAt: stored.completedAt ?? nowIso(),
+      updatedAt: nowIso()
+    });
+    saveState(workspaceRoot, state);
+  }
+  return stored.status;
+}
+
+// A queued or running job whose recorded process is gone (exited, killed, or its
+// pid now belongs to another process) can never finish: mark it failed so it no
+// longer blocks its link key or shows as running. Jobs without a recorded pid are
+// left alone.
+export function reconcileDeadJobs(workspaceRoot, options = {}) {
+  const isGone = options.isGone ?? ((job) => isRecordedProcessGone(job.pid, job.pidStartToken ?? null));
+  const reconciled = [];
+  for (const job of listJobs(workspaceRoot)) {
+    if (!isActiveStatus(job.status) || !Number.isInteger(job.pid) || job.pid <= 0 || !isGone(job)) {
+      continue;
+    }
+    const message = `The Codex companion process (pid ${job.pid}) exited before the job finished.`;
+    if (failActiveJob(workspaceRoot, job.id, message, { expectedPid: job.pid })) {
+      reconciled.push(job.id);
+    }
+  }
+  return reconciled;
+}
+
+// The final write of a run happens only while the job still belongs to this run:
+// active and owned by this process in the index, or, when a concurrent write lost
+// the index entry, in its job file. A job that was cancelled, or removed by
+// SessionEnd (which also deletes its job file), stays as it is.
+function ownedByThisRun(job) {
+  return Boolean(job) && isActiveStatus(job.status) && job.pid === process.pid;
+}
+
+function publishRunOutcome(workspaceRoot, jobId, fileRecord, indexPatch) {
+  const indexed = listJobs(workspaceRoot).find((job) => job.id === jobId);
+  if (indexed ? !ownedByThisRun(indexed) : !ownedByThisRun(readStoredJobOrNull(workspaceRoot, jobId))) {
+    return false;
+  }
+  writeJobFile(workspaceRoot, jobId, fileRecord);
+  const state = loadState(workspaceRoot);
+  const current = state.jobs.find((job) => job.id === jobId);
+  if (current && !ownedByThisRun(current)) {
+    return false;
+  }
+  const timestamp = nowIso();
+  if (current) {
+    Object.assign(current, indexPatch, { updatedAt: timestamp });
+  } else {
+    state.jobs.unshift({ ...fileRecord, ...indexPatch, createdAt: fileRecord.createdAt ?? timestamp, updatedAt: timestamp });
+    delete state.jobs[0].result;
+    delete state.jobs[0].rendered;
+    delete state.jobs[0].request;
+  }
+  saveState(workspaceRoot, state);
+  return true;
+}
+
+const TERMINATION_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"];
+
+// While a job runs in this process, a termination signal marks it failed before
+// the process exits (SIGKILL cannot be caught; reconcileDeadJobs covers that).
+function installSignalHandlers(workspaceRoot, jobId) {
+  if (process.platform === "win32") {
+    return () => {};
+  }
+  const handlers = TERMINATION_SIGNALS.map((signal) => {
+    const handler = () => {
+      try {
+        failActiveJob(workspaceRoot, jobId, `Interrupted by ${signal}.`, { expectedPid: process.pid });
+      } finally {
+        process.exit(128 + (os.constants.signals[signal] ?? 0));
+      }
+    };
+    process.on(signal, handler);
+    return [signal, handler];
+  });
+  return () => {
+    for (const [signal, handler] of handlers) {
+      process.off(signal, handler);
+    }
+  };
+}
+
 function readStoredJobOrNull(workspaceRoot, jobId) {
   const jobFile = resolveJobFile(workspaceRoot, jobId);
   if (!fs.existsSync(jobFile)) {
@@ -146,59 +348,69 @@ export async function runTrackedJob(job, runner, options = {}) {
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
+    pidStartToken: readProcessStartToken(process.pid),
     logFile: options.logFile ?? job.logFile ?? null
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
   upsertJob(job.workspaceRoot, runningRecord);
+  const removeSignalHandlers = installSignalHandlers(job.workspaceRoot, job.id);
 
   try {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...runningRecord,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      completedAt,
-      result: execution.payload,
-      rendered: execution.rendered
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      completedAt
-    });
+    publishRunOutcome(
+      job.workspaceRoot,
+      job.id,
+      {
+        ...runningRecord,
+        status: completionStatus,
+        threadId: execution.threadId ?? null,
+        turnId: execution.turnId ?? null,
+        pid: null,
+        phase: completionStatus === "completed" ? "done" : "failed",
+        completedAt,
+        result: execution.payload,
+        rendered: execution.rendered
+      },
+      {
+        status: completionStatus,
+        threadId: execution.threadId ?? null,
+        turnId: execution.turnId ?? null,
+        summary: execution.summary,
+        phase: completionStatus === "completed" ? "done" : "failed",
+        pid: null,
+        completedAt
+      }
+    );
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...existing,
-      status: "failed",
-      phase: "failed",
-      errorMessage,
-      pid: null,
-      completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      errorMessage,
-      completedAt
-    });
+    publishRunOutcome(
+      job.workspaceRoot,
+      job.id,
+      {
+        ...existing,
+        status: "failed",
+        phase: "failed",
+        errorMessage,
+        pid: null,
+        completedAt,
+        logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
+      },
+      {
+        status: "failed",
+        phase: "failed",
+        pid: null,
+        errorMessage,
+        completedAt
+      }
+    );
     throw error;
+  } finally {
+    removeSignalHandlers();
   }
 }

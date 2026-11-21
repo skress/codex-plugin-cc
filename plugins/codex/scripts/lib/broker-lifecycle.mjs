@@ -6,6 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { readProcessStartToken, shouldSignalRecordedProcess, terminateProcessTree } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -40,19 +41,32 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
-export async function sendBrokerShutdown(endpoint) {
+// Bounded: a broker that does not answer must not use up the SessionEnd hook's
+// time budget before the session's jobs are cleaned up.
+export async function sendBrokerShutdown(endpoint, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 1500;
   await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
+    const timer = setTimeout(() => {
+      socket.destroy();
+      resolve();
+    }, timeoutMs);
+    timer.unref?.();
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
     socket.setEncoding("utf8");
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
     socket.on("data", () => {
-      socket.end();
-      resolve();
+      // Answered: let go of the socket entirely, even if the peer keeps its half open.
+      socket.destroy();
+      done();
     });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
+    socket.on("error", done);
+    socket.on("close", done);
   });
 }
 
@@ -123,6 +137,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
       logFile: existing.logFile ?? null,
       sessionDir: existing.sessionDir ?? null,
       pid: existing.pid ?? null,
+      pidStartToken: existing.pidStartToken ?? null,
       killProcess: options.killProcess ?? null
     });
     clearBrokerSession(cwd);
@@ -148,13 +163,15 @@ export async function ensureBrokerSession(cwd, options = {}) {
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
+    // A broker that becomes ready later would run without a broker.json entry,
+    // so nothing would ever stop it: stop the one this call just spawned.
     teardownBrokerSession({
       endpoint,
       pidFile,
       logFile,
       sessionDir,
       pid: child.pid ?? null,
-      killProcess: options.killProcess ?? null
+      killProcess: options.killProcess ?? terminateProcessTree
     });
     return null;
   }
@@ -164,14 +181,16 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pidFile,
     logFile,
     sessionDir,
-    pid: child.pid ?? null
+    pid: child.pid ?? null,
+    pidStartToken: child.pid ? readProcessStartToken(child.pid) : null
   };
   saveBrokerSession(cwd, session);
   return session;
 }
 
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
-  if (Number.isFinite(pid) && killProcess) {
+export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, pidStartToken = null, killProcess = null }) {
+  // Never signal a broker pid that has exited or now belongs to another process.
+  if (Number.isFinite(pid) && killProcess && shouldSignalRecordedProcess(pid, pidStartToken)) {
     try {
       killProcess(pid);
     } catch {

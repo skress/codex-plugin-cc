@@ -112,7 +112,12 @@ function buildConfigReadResult() {
   }
 }
 
+let batch = null;
 function send(message) {
+  if (batch) {
+    batch.push(JSON.stringify(message) + "\\n");
+    return;
+  }
   process.stdout.write(JSON.stringify(message) + "\\n");
 }
 
@@ -270,9 +275,24 @@ if (args[0] === "login") {
 if (args[0] !== "app-server") {
   process.exit(1);
 }
+if (BEHAVIOR === "descendant-holds-stdout") {
+  // A child that inherits the app-server's stdout and stderr and outlives it.
+  require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], {
+    detached: true,
+    stdio: ["ignore", "inherit", "inherit"]
+  }).unref();
+}
+if (BEHAVIOR === "ignores-shutdown") {
+  // An app-server that survives stdin end and SIGTERM; only SIGKILL stops it.
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1000);
+}
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];
 saveState(bootState);
+// 1 for the first app-server process of this fake, 2 for the second, ...
+const START_INDEX = bootState.appServerStarts;
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
@@ -282,12 +302,32 @@ rl.on("line", (line) => {
 
   const message = JSON.parse(line);
   const state = loadState();
+  // "batched-replies": everything one request produces leaves in a single write,
+  // so a reply and the turn's completion reach the client in the same chunk.
+  if (BEHAVIOR === "batched-replies") {
+    batch = [];
+  }
 
   try {
     switch (message.method) {
       case "initialize":
+        if (BEHAVIOR === "initialize-hangs") {
+          break;
+        }
         state.capabilities = message.params.capabilities || null;
         saveState(state);
+        if (BEHAVIOR === "init-then-close-stdout" || (BEHAVIOR === "resume-hangs-eof-replacement" && START_INDEX === 2)) {
+          // Answers initialize and ends its output in the same callback, staying alive.
+          process.stdout.end(JSON.stringify({ id: message.id, result: { userAgent: "fake-codex-app-server" } }) + "\\n");
+          setInterval(() => {}, 1000);
+          break;
+        }
+        if (BEHAVIOR === "resume-hangs-garbage-replacement" && START_INDEX === 2) {
+          // The replacement answers initialize, then breaks its protocol stream in
+          // the same write.
+          process.stdout.write(JSON.stringify({ id: message.id, result: { userAgent: "fake-codex-app-server" } }) + "\\nnot json\\n");
+          break;
+        }
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
         break;
 
@@ -306,6 +346,12 @@ rl.on("line", (line) => {
         break;
 
       case "thread/start": {
+        if (BEHAVIOR === "closes-stdout") {
+          // The protocol stream ends while the process keeps running.
+          process.stdout.end();
+          setInterval(() => {}, 1000);
+          break;
+        }
         if (BEHAVIOR === "auth-run-fails") {
           throw new Error("authentication expired; run codex login");
         }
@@ -344,10 +390,48 @@ rl.on("line", (line) => {
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
+        state.resumeRequests = (state.resumeRequests || 0) + 1;
+        state.lastResumeParams = message.params;
+        saveState(state);
+        if (BEHAVIOR === "resume-rejects-exclude-turns" && "excludeTurns" in message.params) {
+          send({ id: message.id, error: { code: -32600, message: "Invalid request: unknown field \`excludeTurns\`" } });
+          break;
+        }
+        // Withhold the reply: always, or only in the first app-server process that sees a resume.
+        if (
+          BEHAVIOR === "resume-hangs" ||
+          ((BEHAVIOR === "resume-hangs-garbage-replacement" || BEHAVIOR === "resume-hangs-eof-replacement") && START_INDEX === 1)
+        ) {
+          break;
+        }
+        if (BEHAVIOR === "resume-hangs-once" && !state.resumeHangConsumed) {
+          state.resumeHangConsumed = true;
+          saveState(state);
+          break;
+        }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        const resumed = buildThread(thread);
+        const resumeReply = { id: message.id, result: { thread: resumed, model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } };
+        if (BEHAVIOR === "resume-slow-once" && !state.resumeDelayConsumed) {
+          // The first resume is answered, but late.
+          state.resumeDelayConsumed = true;
+          saveState(state);
+          setTimeout(() => send(resumeReply), 800);
+          break;
+        }
+        if (BEHAVIOR === "resume-large-reply" && !message.params.excludeTurns) {
+          // A big history reply that reaches the client in many chunks.
+          const bigText = "x".repeat(64 * 1024);
+          resumed.turns = Array.from({ length: 48 }, (_, index) => ({
+            id: "turn_hist_" + index,
+            status: "completed",
+            error: null,
+            items: [{ type: "agentMessage", id: "msg_hist_" + index, text: bigText, phase: "final_answer" }]
+          }));
+        }
+        send({ id: message.id, result: { thread: resumed, model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         break;
       }
 
@@ -452,8 +536,59 @@ rl.on("line", (line) => {
 	          outputSchema: message.params.outputSchema ?? null,
 	          prompt
 	        };
+	        state.turnStartRequests = (state.turnStartRequests || 0) + 1;
 	        saveState(state);
+	        if (BEHAVIOR === "turn-start-hangs") {
+	          break;
+	        }
+	        if (BEHAVIOR === "turn-start-slow-ack") {
+	          // Acknowledge late, then run until interrupted.
+	          interruptibleTurns.set(turnId, { threadId: thread.id, timer: null });
+	          setTimeout(() => {
+	            send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	            send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          }, 400);
+	          break;
+	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+	        if (BEHAVIOR === "turn-quiet-with-unrelated-thread") {
+	          // The turn goes quiet; a thread it never spawned starts and keeps working.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          interruptibleTurns.set(turnId, { threadId: thread.id, timer: null });
+	          send({ method: "thread/started", params: { thread: { id: "thr_unrelated", name: "unrelated" } } });
+	          setInterval(() => {
+	            send({ method: "item/completed", params: { threadId: "thr_unrelated", turnId: "turn_unrelated", item: { type: "agentMessage", id: "msg_noise", text: "noise", phase: "analysis" } } });
+	          }, 200);
+	          break;
+	        }
+
+	        if (BEHAVIOR === "turn-quiet-with-name-noise") {
+	          // The turn goes quiet, but name updates of another thread keep arriving.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          interruptibleTurns.set(turnId, { threadId: thread.id, timer: null });
+	          setInterval(() => {
+	            send({ method: "thread/name/updated", params: { threadId: "thr_unrelated", threadName: "noise" } });
+	          }, 200);
+	          break;
+	        }
+
+	        if (BEHAVIOR === "turn-quiet-with-noise") {
+	          // The turn goes quiet, but events of another thread keep arriving.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          interruptibleTurns.set(turnId, { threadId: thread.id, timer: null });
+	          setInterval(() => {
+	            send({ method: "item/completed", params: { threadId: "thr_unrelated", turnId: "turn_unrelated", item: { type: "agentMessage", id: "msg_noise", text: "noise", phase: "analysis" } } });
+	          }, 200);
+	          break;
+	        }
+
+	        if (BEHAVIOR === "turn-never-completes" || BEHAVIOR === "turn-never-completes-interrupt-fails") {
+	          // Acknowledge the turn and go quiet; only turn/interrupt ends it.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          interruptibleTurns.set(turnId, { threadId: thread.id, timer: null });
+	          break;
+	        }
 
         if (BEHAVIOR === "turn-fails") {
           const error = { message: "The 'no-such-model' model is not supported when using Codex with a ChatGPT account." };
@@ -622,7 +757,13 @@ rl.on("line", (line) => {
 	          threadId: message.params.threadId,
 	          turnId: message.params.turnId
 	        };
+	        state.interruptRequests = (state.interruptRequests || 0) + 1;
 	        saveState(state);
+	        if (BEHAVIOR === "turn-never-completes-interrupt-fails") {
+	          // The interrupt is refused and the turn keeps running.
+	          send({ id: message.id, error: { code: -32000, message: "interrupt refused" } });
+	          break;
+	        }
 	        const pending = interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
 	          clearTimeout(pending.timer);
@@ -645,6 +786,13 @@ rl.on("line", (line) => {
     }
   } catch (error) {
     send({ id: message.id, error: { code: -32000, message: error.message } });
+  }
+  if (batch) {
+    const lines = batch.join("");
+    batch = null;
+    if (lines) {
+      process.stdout.write(lines);
+    }
   }
 });
 `;

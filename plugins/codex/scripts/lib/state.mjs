@@ -444,7 +444,11 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  // Write and rename, so a concurrent reader (for example a background worker
+  // reading its queued record) never sees a truncated file.
+  const tempFile = `${jobFile}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+  fs.writeFileSync(tempFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  fs.renameSync(tempFile, jobFile);
   return jobFile;
 }
 
