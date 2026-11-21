@@ -22,6 +22,8 @@ const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact
 // broker's answer, which comes after the restart.
 const UPSTREAM_CLOSE_TIMEOUT_MS = 2000;
 const SHUTDOWN_STEP_TIMEOUT_MS = 2000;
+// The client waits 30 s longer than the broker's request limit; answer well before.
+const RESTART_REPLY_LIMIT_MS = 15000;
 
 function withLimit(promise, timeoutMs) {
   let timer = null;
@@ -103,6 +105,11 @@ async function main() {
   // not end within the request limit the app-server is replaced.
   let orphanTimer = null;
   const orphanLimitMs = resolveTimeoutMs(RPC_TIMEOUT_ENV, DEFAULT_RPC_TIMEOUT_MS);
+  // Turns that completed while their start request was still being answered: the
+  // completion can arrive in the same read as the reply, before the request
+  // handler runs again, and must not leave a stream owned by a finished turn.
+  const completedBeforeStart = new Set();
+  let shuttingDown = false;
   const sockets = new Set();
 
   async function connectUpstream() {
@@ -131,7 +138,7 @@ async function main() {
   }
 
   async function restartUpstreamIfIdle() {
-    if (!restartReason || isOwned()) {
+    if (!restartReason || isOwned() || shuttingDown) {
       return;
     }
     if (!restarting) {
@@ -139,7 +146,13 @@ async function main() {
         const previous = appClient;
         await previous.close().catch(() => {});
         try {
-          appClient = await connectUpstream();
+          const replacement = await connectUpstream();
+          if (shuttingDown) {
+            // Shutdown began meanwhile: never leave a replacement running.
+            await replacement.close().catch(() => {});
+            return;
+          }
+          appClient = replacement;
           restartReason = null;
         } catch (error) {
           process.stderr.write(`Failed to restart the Codex app-server: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -172,16 +185,19 @@ async function main() {
     if (!activeStreamTurn || orphanTimer) {
       return;
     }
-    const { threadId, turnId } = activeStreamTurn;
+    const orphan = activeStreamTurn;
+    const { threadId, turnId } = orphan;
     const upstream = appClient;
+    // Acts only while this very turn still owns the broker on this app-server.
+    const stillOrphaned = () => appClient === upstream && activeStreamTurn === orphan && activeStreamSocket?.destroyed;
     orphanTimer = setTimeout(() => {
-      if (appClient === upstream && activeStreamSocket?.destroyed) {
+      if (stillOrphaned()) {
         replaceUpstream("orphaned turn did not end");
       }
     }, orphanLimitMs);
     orphanTimer.unref?.();
     upstream.request("turn/interrupt", { threadId, turnId }).catch(() => {
-      if (appClient === upstream && activeStreamSocket?.destroyed) {
+      if (stillOrphaned()) {
         replaceUpstream("orphaned turn could not be interrupted");
       }
     });
@@ -209,23 +225,32 @@ async function main() {
       return;
     }
     send(target, message);
+    if (message.method === "turn/completed" && activeRequestSocket === target && activeStreamSocket !== target) {
+      const turnId = message.params?.turn?.id ?? null;
+      if (turnId) {
+        completedBeforeStart.add(turnId);
+      }
+    }
     if (message.method === "turn/completed" && activeStreamSocket === target) {
       const threadId = message.params?.threadId ?? null;
       const turnId = message.params?.turn?.id ?? null;
       // A completion of another turn on the same thread (for example a late one)
       // does not end the current stream.
-      const otherTurn = Boolean(turnId && activeStreamTurn?.turnId && threadId === activeStreamTurn.threadId && turnId !== activeStreamTurn.turnId);
+      const otherTurn = Boolean(turnId && activeStreamTurn?.turnId && turnId !== activeStreamTurn.turnId && activeStreamThreadIds?.has(threadId));
       if (!otherTurn && (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId))) {
+        // A request of the same client that is still running keeps its own
+        // ownership; the request handler releases it when it settles.
         releaseStream();
-        if (activeRequestSocket === target) {
-          activeRequestSocket = null;
-        }
         void restartUpstreamIfIdle();
       }
     }
   }
 
   async function shutdown(server) {
+    shuttingDown = true;
+    if (restarting) {
+      await withLimit(restarting, SHUTDOWN_STEP_TIMEOUT_MS * 3);
+    }
     for (const socket of sockets) {
       socket.end();
       // A peer that keeps its half open must not stall the shutdown.
@@ -318,6 +343,10 @@ async function main() {
             const result = await appClient.request(message.method, message.params ?? {});
             send(socket, { id: message.id, result });
           } catch (error) {
+            if (isRequestTimeoutError(error)) {
+              // Replace the app-server once the running turn released the broker.
+              restartReason = restartReason ?? "timeout";
+            }
             send(socket, {
               id: message.id,
               error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
@@ -337,12 +366,17 @@ async function main() {
             continue;
           }
           send(socket, { id: message.id, result });
-          if (isStreaming) {
+          const startedTurnId = result?.turn?.id ?? null;
+          const finishedAlready =
+            (startedTurnId && completedBeforeStart.has(startedTurnId)) ||
+            (result?.turn?.status && result.turn.status !== "inProgress");
+          completedBeforeStart.clear();
+          if (isStreaming && !finishedAlready) {
             activeStreamSocket = socket;
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
-            const turnId = result?.turn?.id ?? null;
-            const threadId = message.params?.threadId ?? null;
-            activeStreamTurn = turnId && threadId ? { threadId, turnId } : null;
+            // A detached review runs its turn on the review thread.
+            const threadId = result?.reviewThreadId ?? message.params?.threadId ?? null;
+            activeStreamTurn = startedTurnId && threadId ? { threadId, turnId: startedTurnId } : null;
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
@@ -369,7 +403,8 @@ async function main() {
             if (activeStreamSocket === socket) {
               releaseStream();
             }
-            await restartUpstreamIfIdle();
+            // Bounded, so the client still gets this answer within its own limit.
+            await withLimit(restartUpstreamIfIdle(), RESTART_REPLY_LIMIT_MS);
             const upstreamRestarted = !restartReason && appClient !== upstream;
             send(socket, {
               id: message.id,
@@ -381,6 +416,7 @@ async function main() {
             });
             continue;
           }
+          completedBeforeStart.clear();
           send(socket, {
             id: message.id,
             error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)

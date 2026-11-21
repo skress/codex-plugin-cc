@@ -99,18 +99,23 @@ async function handleSessionEnd(input) {
   const logFile = brokerSession?.logFile ?? null;
   const sessionDir = brokerSession?.sessionDir ?? null;
   const pid = brokerSession?.pid ?? null;
+  const pidStartToken = brokerSession?.pidStartToken ?? null;
+
+  // Jobs first: their records go and their processes are signalled while the
+  // broker still serves them, so no job process sees its connection drop and
+  // writes a record back after the cleanup.
+  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
 
   if (brokerEndpoint) {
     await sendBrokerShutdown(brokerEndpoint);
   }
-
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,
     logFile,
     sessionDir,
     pid,
+    pidStartToken,
     killProcess: terminateProcessTree
   });
   clearBrokerSession(cwd);

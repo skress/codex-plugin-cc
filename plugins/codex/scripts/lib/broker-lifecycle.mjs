@@ -6,6 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { isRecordedProcessGone, readProcessStartToken } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -60,7 +61,8 @@ export async function sendBrokerShutdown(endpoint, options = {}) {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
     socket.on("data", () => {
-      socket.end();
+      // Answered: let go of the socket entirely, even if the peer keeps its half open.
+      socket.destroy();
       done();
     });
     socket.on("error", done);
@@ -135,6 +137,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
       logFile: existing.logFile ?? null,
       sessionDir: existing.sessionDir ?? null,
       pid: existing.pid ?? null,
+      pidStartToken: existing.pidStartToken ?? null,
       killProcess: options.killProcess ?? null
     });
     clearBrokerSession(cwd);
@@ -176,14 +179,16 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pidFile,
     logFile,
     sessionDir,
-    pid: child.pid ?? null
+    pid: child.pid ?? null,
+    pidStartToken: child.pid ? readProcessStartToken(child.pid) : null
   };
   saveBrokerSession(cwd, session);
   return session;
 }
 
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
-  if (Number.isFinite(pid) && killProcess) {
+export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, pidStartToken = null, killProcess = null }) {
+  // Never signal a broker pid that has exited or now belongs to another process.
+  if (Number.isFinite(pid) && killProcess && !isRecordedProcessGone(pid, pidStartToken)) {
     try {
       killProcess(pid);
     } catch {

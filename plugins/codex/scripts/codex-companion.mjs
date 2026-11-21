@@ -1028,6 +1028,19 @@ async function handleCancel(argv) {
     );
   }
 
+  // The interrupt above took time: the job may have finished meanwhile. Its own
+  // outcome then stands.
+  const current = listJobs(workspaceRoot).find((entry) => entry.id === job.id);
+  if (!current || (current.status !== "queued" && current.status !== "running")) {
+    const finishedStatus = current?.status ?? "removed";
+    outputCommandResult(
+      { jobId: job.id, status: finishedStatus, title: job.title, turnInterruptAttempted: interrupt.attempted, turnInterrupted: interrupt.interrupted },
+      `Job ${job.id} already finished (${finishedStatus}); nothing to cancel.\n`,
+      options.json
+    );
+    return;
+  }
+
   const completedAt = nowIso();
   const nextJob = {
     ...job,

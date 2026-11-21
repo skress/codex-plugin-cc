@@ -124,7 +124,7 @@ Checks Codex install and login. The **review gate** (off by default) runs a Code
 |---|---|
 | "not logged in" / auth error | `!codex login` in Claude Code, then `/codex:setup` |
 | "Task … is still running" on ask/rescue | a background job of this session is busy; `/codex:status`, wait or `/codex:cancel` |
-| "did not answer thread/resume within …" | Codex's app-server stalled resuming the thread; the shared broker restarted it and the runtime already retried once. Run the command again; if it keeps failing, `--fresh` |
+| "did not answer thread/resume within …" | Codex's app-server stalled resuming the thread (no turn was started). Through the shared broker the app-server is restarted, and the resume was retried once if the restart succeeded in time. Run the command again; if it keeps failing, `--fresh` |
 | "did not answer turn/start …" / "may still be running" | the prompt may have reached Codex; check `codex resume <thread>` before sending it again |
 | "No activity from Codex for …" | the turn produced no event for 30 min and was interrupted (`CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS` changes the limit) |
 | rate or usage limit | wait; the commands don't retry |

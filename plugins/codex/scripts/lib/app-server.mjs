@@ -295,6 +295,12 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.handleExit(error);
     });
 
+    // A write to an app-server that stopped reading fails asynchronously
+    // (EPIPE); without a handler that error would crash this process.
+    this.proc.stdin.on("error", (error) => {
+      this.handleExit(createProtocolError(`codex app-server stopped reading its input (${error.code ?? error.message}).`));
+    });
+
     this.proc.on("exit", (code, signal) => {
       const stderr = this.stderr.trim();
       const detail =
@@ -313,9 +319,15 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     // The protocol stream ended: nothing can answer any more, even if the
     // process keeps running. close() still stops the process.
     this.readline.on("close", () => {
-      if (!this.closed) {
-        this.handleExit(createProtocolError("codex app-server closed its output stream."));
+      if (this.closed) {
+        return;
       }
+      // Give a crashing process a moment to report its exit code and stderr.
+      setTimeout(() => {
+        if (!this.closed) {
+          this.handleExit(createProtocolError("codex app-server closed its output stream."));
+        }
+      }, 200).unref?.();
     });
 
     await this.request("initialize", {
@@ -370,6 +382,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
         }
       }
       await waitWithLimit(gone, Math.min(SIGKILL_WAIT_MS, this.closeTimeoutMs));
+    }
+    // A descendant that inherited the pipes must not keep this process alive.
+    for (const stream of [this.proc?.stdin, this.proc?.stdout, this.proc?.stderr]) {
+      stream?.destroy();
     }
     this.handleExit(null);
   }

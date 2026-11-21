@@ -625,11 +625,19 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     if (message.method === "thread/started" || message.method === "thread/name/updated") {
-      applyTurnNotification(state, message);
-      const startedThreadId = message.params?.thread?.id ?? message.params?.threadId ?? null;
-      if (startedThreadId && state.threadIds.has(startedThreadId)) {
+      // Applying registers the thread, so membership is checked before: only a
+      // thread already part of this turn counts as activity.
+      const eventThreadId = message.params?.thread?.id ?? message.params?.threadId ?? null;
+      const known = Boolean(eventThreadId && state.threadIds.has(eventThreadId));
+      if (message.method === "thread/name/updated" && !known) {
+        // A rename of a thread this turn never started is not ours.
+        previousHandler?.(message);
+        return;
+      }
+      if (known) {
         armIdleTimer();
       }
+      applyTurnNotification(state, message);
       return;
     }
 

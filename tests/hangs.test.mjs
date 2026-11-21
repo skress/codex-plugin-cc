@@ -10,9 +10,9 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
-import { ensureBrokerSession, sendBrokerShutdown } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { ensureBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
-import { readProcessStartToken } from "../plugins/codex/scripts/lib/process.mjs";
+import { readProcessStartToken, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 
 // Process start tokens are not available on Windows.
@@ -560,4 +560,165 @@ test("SessionEnd does not signal a process that reused a job's pid", TOKENS, asy
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(isAlive(sleeper.pid), true, "SessionEnd killed an unrelated process");
   assert.equal(listJobs(ctx.repo).some((job) => job.id === "task-foreign"), false);
+});
+
+test("a turn that completes together with its acknowledgement leaves the broker free", () => {
+  const ctx = setupRepo("batched-replies");
+
+  const first = task(ctx, ["--link-key", "impl", "--json", "first round"]);
+  const second = task(ctx, ["--link-key", "impl", "--resume-last", "--json", "second round"]);
+
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(second.status, 0, second.stderr);
+  // No orphan interrupt for the finished turn, and no app-server restart.
+  assert.equal(ctx.fakeState().lastInterrupt, null);
+  assert.equal(ctx.fakeState().appServerStarts, 1);
+});
+
+function runClientScript(ctx, source, timeoutMs = 20000) {
+  const started = Date.now();
+  const result = spawnSync("node", ["--input-type=module", "-e", source, ctx.repo], {
+    cwd: ctx.repo,
+    env: ctx.env(),
+    encoding: "utf8",
+    timeout: timeoutMs
+  });
+  return { ...result, elapsedMs: Date.now() - started };
+}
+
+const APP_SERVER_MODULE = JSON.stringify(path.join(ROOT, "plugins", "codex", "scripts", "lib", "app-server.mjs"));
+
+test("a write error on the app-server's stdin fails pending requests instead of crashing", () => {
+  const ctx = setupRepo();
+  // An EPIPE arrives as an asynchronous error event on the child's stdin; an
+  // unhandled one would crash the process.
+  const result = runClientScript(ctx, `
+    const { CodexAppServerClient } = await import(${APP_SERVER_MODULE});
+    const client = await CodexAppServerClient.connect(process.argv[1], { disableBroker: true, requestTimeoutMs: 30000, closeTimeoutMs: 300 });
+    const pending = client.request("thread/list", {}).then(() => "answered", (error) => "rejected: " + error.message);
+    client.proc.stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+    process.stdout.write(await Promise.race([pending, new Promise((resolve) => setTimeout(() => resolve("still pending"), 5000).unref())]));
+    await client.close();
+  `);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^rejected/);
+});
+
+test("closing a direct client does not wait for descendants that hold its output pipes", () => {
+  const ctx = setupRepo("descendant-holds-stdout");
+  const result = runClientScript(ctx, `
+    const { CodexAppServerClient } = await import(${APP_SERVER_MODULE});
+    const client = await CodexAppServerClient.connect(process.argv[1], { disableBroker: true, closeTimeoutMs: 300 });
+    await client.close();
+  `);
+
+  assert.equal(result.status, 0, result.stderr);
+  // The descendant lives 3 s; the client process must not wait for it.
+  assert.ok(result.elapsedMs < 2500, `exited after ${result.elapsedMs} ms`);
+});
+
+test("name updates of other threads do not keep a quiet turn alive", () => {
+  const ctx = setupRepo("turn-quiet-with-name-noise");
+
+  const result = task(ctx, ["--link-key", "impl", "--json", "first round"], { timeoutMs: 20000 });
+
+  assert.notEqual(result.error?.code, "ETIMEDOUT", "the idle limit never fired");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /No activity from Codex/);
+});
+
+test("SessionEnd during a running task leaves no job record behind", async () => {
+  const ctx = setupRepo("turn-never-completes");
+  const child = spawn("node", [SCRIPT, "task", "--link-key", "impl", "--json", "first round"], {
+    cwd: ctx.repo,
+    env: ctx.env("sess-a", { CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "60000" }),
+    stdio: "ignore"
+  });
+  const exited = new Promise((resolve) => child.on("exit", resolve));
+  assert.ok(await waitUntil(() => jobsForKey(ctx, "impl")[0]?.threadId, 15000), "task never got going");
+  const jobId = jobsForKey(ctx, "impl")[0].id;
+
+  const hook = run("node", [path.join(ROOT, "plugins", "codex", "scripts", "session-lifecycle-hook.mjs"), "SessionEnd"], {
+    cwd: ctx.repo,
+    env: ctx.env(),
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-a", cwd: ctx.repo })
+  });
+  assert.equal(hook.status, 0, hook.stderr);
+  await exited;
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  assert.deepEqual(listJobs(ctx.repo).filter((job) => job.sessionId === "sess-a"), []);
+  assert.equal(fs.existsSync(resolveJobFile(ctx.repo, jobId)), false);
+});
+
+test("terminateProcessTree signals the process itself when it leads no process group", () => {
+  const calls = [];
+  const outcome = terminateProcessTree(4242, {
+    platform: "darwin",
+    killImpl(pid, signal) {
+      calls.push([pid, signal]);
+      if (pid < 0) {
+        const error = new Error("no such process group");
+        error.code = "ESRCH";
+        throw error;
+      }
+    }
+  });
+
+  assert.deepEqual(calls, [[-4242, "SIGTERM"], [4242, "SIGTERM"]]);
+  assert.equal(outcome.delivered, true);
+  assert.equal(outcome.method, "process");
+});
+
+test("SessionEnd teardown does not signal a reused broker pid", TOKENS, () => {
+  const killed = [];
+  teardownBrokerSession({ pid: process.pid, pidStartToken: "not-the-start-of-this-process", killProcess: (pid) => killed.push(pid) });
+  assert.deepEqual(killed, []);
+  teardownBrokerSession({ pid: process.pid, pidStartToken: readProcessStartToken(process.pid), killProcess: (pid) => killed.push(pid) });
+  assert.deepEqual(killed, [process.pid]);
+});
+
+test("a dead job whose job file already says completed is reconciled as completed", () => {
+  const ctx = setupRepo();
+  upsertJob(ctx.repo, { id: "task-done", kind: "task", jobClass: "task", status: "running", sessionId: "sess-a", linkKey: "impl", pid: deadPid() });
+  writeJobFile(ctx.repo, "task-done", { id: "task-done", status: "completed", phase: "done", threadId: "thr_9", completedAt: "2026-11-21T00:00:00.000Z", result: { status: 0 } });
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: ctx.repo, env: ctx.env() });
+
+  assert.equal(status.status, 0, status.stderr);
+  const job = listJobs(ctx.repo).find((entry) => entry.id === "task-done");
+  assert.equal(job.status, "completed");
+  assert.equal(job.threadId, "thr_9");
+  assert.equal(readJobFile(resolveJobFile(ctx.repo, "task-done")).status, "completed");
+});
+
+test("a broker shutdown request returns and lets go of a peer that answers and stays open", async () => {
+  const dir = makeTempDir();
+  const socketPath = path.join(dir, "half-open.sock");
+  const held = [];
+  const server = net.createServer({ allowHalfOpen: true }, (socket) => {
+    held.push(socket);
+    socket.on("data", () => socket.write(`${JSON.stringify({ id: 1, result: {} })}\n`));
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    const lifecycle = JSON.stringify(path.join(ROOT, "plugins", "codex", "scripts", "lib", "broker-lifecycle.mjs"));
+    const started = Date.now();
+    const child = spawn("node", ["--input-type=module", "-e", `
+      const { sendBrokerShutdown } = await import(${lifecycle});
+      await sendBrokerShutdown(process.argv[1], { timeoutMs: 300 });
+    `, `unix:${socketPath}`], { stdio: "ignore" });
+    const exited = await Promise.race([
+      new Promise((resolve) => child.on("exit", () => resolve(true))),
+      new Promise((resolve) => setTimeout(() => resolve(false), 3000))
+    ]);
+    child.kill("SIGKILL");
+    assert.ok(exited, `the shutdown client was still running after ${Date.now() - started} ms`);
+  } finally {
+    for (const socket of held) {
+      socket.destroy();
+    }
+    await new Promise((resolve) => server.close(resolve));
+  }
 });

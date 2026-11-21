@@ -112,7 +112,12 @@ function buildConfigReadResult() {
   }
 }
 
+let batch = null;
 function send(message) {
+  if (batch) {
+    batch.push(JSON.stringify(message) + "\\n");
+    return;
+  }
   process.stdout.write(JSON.stringify(message) + "\\n");
 }
 
@@ -270,6 +275,13 @@ if (args[0] === "login") {
 if (args[0] !== "app-server") {
   process.exit(1);
 }
+if (BEHAVIOR === "descendant-holds-stdout") {
+  // A child that inherits the app-server's stdout and stderr and outlives it.
+  require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], {
+    detached: true,
+    stdio: ["ignore", "inherit", "inherit"]
+  }).unref();
+}
 if (BEHAVIOR === "ignores-shutdown") {
   // An app-server that survives stdin end and SIGTERM; only SIGKILL stops it.
   process.on("SIGTERM", () => {});
@@ -288,6 +300,11 @@ rl.on("line", (line) => {
 
   const message = JSON.parse(line);
   const state = loadState();
+  // "batched-replies": everything one request produces leaves in a single write,
+  // so a reply and the turn's completion reach the client in the same chunk.
+  if (BEHAVIOR === "batched-replies") {
+    batch = [];
+  }
 
   try {
     switch (message.method) {
@@ -518,6 +535,16 @@ rl.on("line", (line) => {
 	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
+	        if (BEHAVIOR === "turn-quiet-with-name-noise") {
+	          // The turn goes quiet, but name updates of another thread keep arriving.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          interruptibleTurns.set(turnId, { threadId: thread.id, timer: null });
+	          setInterval(() => {
+	            send({ method: "thread/name/updated", params: { threadId: "thr_unrelated", threadName: "noise" } });
+	          }, 200);
+	          break;
+	        }
+
 	        if (BEHAVIOR === "turn-quiet-with-noise") {
 	          // The turn goes quiet, but events of another thread keep arriving.
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
@@ -725,6 +752,13 @@ rl.on("line", (line) => {
     }
   } catch (error) {
     send({ id: message.id, error: { code: -32000, message: error.message } });
+  }
+  if (batch) {
+    const lines = batch.join("");
+    batch = null;
+    if (lines) {
+      process.stdout.write(lines);
+    }
   }
 });
 `;
