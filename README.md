@@ -216,6 +216,8 @@ Use it to:
 - see the latest completed job
 - confirm whether a task is still running
 
+A job whose process is gone (killed, crashed) is shown as failed instead of running forever, and no longer blocks a follow-up on its thread. Requests to Codex are bounded (a stalled app-server fails the command after about two minutes instead of hanging, and the shared app-server is restarted), and a turn without any Codex activity for 30 minutes is interrupted.
+
 ### `/codex:result`
 
 Shows the final stored Codex output for a finished job.
