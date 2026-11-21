@@ -11,6 +11,7 @@
  *   threadId: string,
  *   rootThreadId: string,
  *   threadIds: Set<string>,
+ *   activityThreadIds: Set<string>,
  *   threadTurnIds: Map<string, string>,
  *   threadLabels: Map<string, string>,
  *   turnId: string | null,
@@ -325,6 +326,9 @@ function createTurnCaptureState(threadId, options = {}) {
     threadId,
     rootThreadId: threadId,
     threadIds: new Set([threadId]),
+    // Threads whose events show this turn is alive: the turn's own thread and the
+    // subagents it addressed (collab receivers), not every thread that started.
+    activityThreadIds: new Set([threadId]),
     threadTurnIds: new Map(),
     threadLabels: new Map(),
     turnId: null,
@@ -426,8 +430,12 @@ function recordItem(state, item, lifecycle, threadId = null) {
         scheduleInferredCompletion(state);
       }
     }
+    const fromTurnThread = !threadId || state.activityThreadIds.has(threadId);
     for (const receiverThreadId of item.receiverThreadIds ?? []) {
       registerThread(state, receiverThreadId);
+      if (fromTurnThread) {
+        state.activityThreadIds.add(receiverThreadId);
+      }
     }
   }
 
@@ -634,7 +642,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         previousHandler?.(message);
         return;
       }
-      if (known) {
+      if (eventThreadId && state.activityThreadIds.has(eventThreadId)) {
         armIdleTimer();
       }
       applyTurnNotification(state, message);
@@ -648,10 +656,13 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         return;
     }
 
-    // Only this turn's own events (its threads, including subagents) count as
-    // activity; events of other threads must not keep a quiet turn alive.
-    armIdleTimer();
+    // Only this turn's own events (its thread and the subagents it addressed)
+    // count as activity; events of other threads must not keep a quiet turn alive.
     applyTurnNotification(state, message);
+    const activityThreadId = extractThreadId(message);
+    if (activityThreadId && state.activityThreadIds.has(activityThreadId)) {
+      armIdleTimer();
+    }
   });
 
   try {
@@ -662,6 +673,10 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       throw isRequestTimeoutError(error) ? describeTurnStartTimeout(error, threadId) : error;
     }
     options.onResponse?.(response, state);
+    // A detached review runs on its own thread, which onResponse registered.
+    for (const responseThreadId of state.threadIds) {
+      state.activityThreadIds.add(responseThreadId);
+    }
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
       state.threadTurnIds.set(state.threadId, state.turnId);

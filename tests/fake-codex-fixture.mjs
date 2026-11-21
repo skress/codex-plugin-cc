@@ -291,6 +291,8 @@ const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
 bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];
 saveState(bootState);
+// 1 for the first app-server process of this fake, 2 for the second, ...
+const START_INDEX = bootState.appServerStarts;
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
@@ -314,6 +316,12 @@ rl.on("line", (line) => {
         }
         state.capabilities = message.params.capabilities || null;
         saveState(state);
+        if (BEHAVIOR === "resume-hangs-garbage-replacement" && START_INDEX === 2) {
+          // The replacement answers initialize, then breaks its protocol stream in
+          // the same write.
+          process.stdout.write(JSON.stringify({ id: message.id, result: { userAgent: "fake-codex-app-server" } }) + "\\nnot json\\n");
+          break;
+        }
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
         break;
 
@@ -384,7 +392,7 @@ rl.on("line", (line) => {
           break;
         }
         // Withhold the reply: always, or only in the first app-server process that sees a resume.
-        if (BEHAVIOR === "resume-hangs") {
+        if (BEHAVIOR === "resume-hangs" || (BEHAVIOR === "resume-hangs-garbage-replacement" && START_INDEX === 1)) {
           break;
         }
         if (BEHAVIOR === "resume-hangs-once" && !state.resumeHangConsumed) {
@@ -534,6 +542,17 @@ rl.on("line", (line) => {
 	          break;
 	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+	        if (BEHAVIOR === "turn-quiet-with-unrelated-thread") {
+	          // The turn goes quiet; a thread it never spawned starts and keeps working.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          interruptibleTurns.set(turnId, { threadId: thread.id, timer: null });
+	          send({ method: "thread/started", params: { thread: { id: "thr_unrelated", name: "unrelated" } } });
+	          setInterval(() => {
+	            send({ method: "item/completed", params: { threadId: "thr_unrelated", turnId: "turn_unrelated", item: { type: "agentMessage", id: "msg_noise", text: "noise", phase: "analysis" } } });
+	          }, 200);
+	          break;
+	        }
 
 	        if (BEHAVIOR === "turn-quiet-with-name-noise") {
 	          // The turn goes quiet, but name updates of another thread keep arriving.

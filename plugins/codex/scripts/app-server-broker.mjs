@@ -16,13 +16,14 @@ import {
   resolveTimeoutMs
 } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { terminateProcessTree } from "./lib/process.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 // Killing a wedged app-server should not take long; the client waits for the
 // broker's answer, which comes after the restart.
 const UPSTREAM_CLOSE_TIMEOUT_MS = 2000;
 const SHUTDOWN_STEP_TIMEOUT_MS = 2000;
-// The client waits 30 s longer than the broker's request limit; answer well before.
+// The client waits 20 s longer than the broker's request limit; answer before that.
 const RESTART_REPLY_LIMIT_MS = 15000;
 
 function withLimit(promise, timeoutMs) {
@@ -96,13 +97,19 @@ async function main() {
   process.on("exit", () => {
     for (const child of upstreamProcesses) {
       try {
-        child.kill("SIGKILL");
+        if (process.platform === "win32") {
+          // The child is a shell wrapper there; end the whole tree.
+          terminateProcessTree(child.pid);
+        } else {
+          child.kill("SIGKILL");
+        }
       } catch {
         // Already gone.
       }
     }
   });
-  let appClient = await connectUpstream();
+  let appClient = null;
+  appClient = await connectUpstream();
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
@@ -298,6 +305,7 @@ async function main() {
         if (!line.trim()) {
           continue;
         }
+        const receivedAt = Date.now();
 
         let message;
         try {
@@ -379,9 +387,12 @@ async function main() {
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
         const upstream = appClient;
+        // Time spent waiting for a restart counts against this request's budget,
+        // so the client still gets the broker's answer within its own limit.
+        const remainingMs = Math.max(1000, orphanLimitMs - (Date.now() - receivedAt));
 
         try {
-          const result = await upstream.request(message.method, message.params ?? {});
+          const result = await upstream.request(message.method, message.params ?? {}, { timeoutMs: remainingMs });
           if (upstream !== appClient) {
             // Answered by an app-server that was replaced meanwhile.
             continue;

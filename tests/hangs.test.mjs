@@ -163,10 +163,13 @@ test("a broker keeps serving other clients after an upstream request timed out",
   linkThread(ctx, "impl");
   assert.equal(task(ctx, ["--link-key", "impl", "--resume-last", "--json", "second round"], { timeoutMs: 30000 }).status, 1);
 
+  const startsBefore = ctx.fakeState().appServerStarts;
   const fresh = task(ctx, ["--link-key", "review", "--json", "new thread"]);
 
   assert.equal(fresh.status, 0, fresh.stderr);
   assert.equal(JSON.parse(fresh.stdout).resumed, false);
+  // Served by the broker's restarted app-server, not by a direct fallback.
+  assert.equal(ctx.fakeState().appServerStarts, startsBefore);
 });
 
 test("a turn/start that is never acknowledged fails without replaying the turn", () => {
@@ -738,6 +741,14 @@ test("a refused idle interrupt does not release the turn: the broker replaces th
   // an orphan (interrupt again, refused, then replace the app-server) instead of
   // handing the live turn's events to the next client.
   assert.ok(await waitUntil(() => ctx.fakeState().appServerStarts >= 2, 8000), "the broker kept the app-server with the live orphaned turn");
+  // The replacement belongs to the broker (not a direct fallback), and the broker serves again.
+  const endpoint = await startBroker(ctx);
+  const client = brokerSocket(endpoint);
+  await client.connected;
+  const answer = await client.reply(client.send("thread/list", {}));
+  client.socket.destroy();
+  assert.equal(answer.error, undefined, JSON.stringify(answer.error));
+  assert.equal(ctx.fakeState().appServerStarts, 2);
 });
 
 test("a process that exited but was not reaped yet counts as gone", { skip: process.platform === "win32" ? "no zombies on Windows" : false }, async () => {
@@ -825,4 +836,61 @@ test("cancel leaves a job alone whose job file already holds its outcome", TOKEN
   assert.equal(listJobs(ctx.repo).find((job) => job.id === "task-finished").status, "completed");
   await new Promise((resolve) => setTimeout(resolve, 200));
   assert.equal(isAlive(sleeper.pid), true, "cancel signalled the process of a finished job");
+});
+
+test("a queued background job records its worker's start token right away", TOKENS, async () => {
+  const ctx = setupRepo("turn-never-completes");
+
+  const queued = task(ctx, ["--background", "--link-key", "impl", "--json", "background round"], {
+    env: ctx.env("sess-a", { CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "60000" })
+  });
+
+  assert.equal(queued.status, 0, queued.stderr);
+  const { jobId } = JSON.parse(queued.stdout);
+  const record = readJobFile(resolveJobFile(ctx.repo, jobId));
+  try {
+    assert.ok(record.pidStartToken, `no start token on ${JSON.stringify({ status: record.status, pid: record.pid })}`);
+  } finally {
+    // Cancel only once the worker runs its turn, so its broker is recorded and torn down.
+    await waitUntil(() => listJobs(ctx.repo).find((job) => job.id === jobId)?.threadId, 15000);
+    run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: ctx.repo, env: ctx.env() });
+  }
+});
+
+test("a replacement app-server that breaks during initialize is not reported as a restart", () => {
+  const ctx = setupRepo("resume-hangs-garbage-replacement");
+  linkThread(ctx, "impl");
+
+  const result = task(ctx, ["--link-key", "impl", "--resume-last", "--json", "second round"], { timeoutMs: 30000 });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /did not answer thread\/resume/);
+  assert.doesNotMatch(result.stderr, /client is closed/);
+  // No retry on a replacement that never worked.
+  assert.equal(ctx.fakeState().resumeRequests, 1);
+});
+
+test("a thread the turn never spawned does not keep a quiet turn alive", () => {
+  const ctx = setupRepo("turn-quiet-with-unrelated-thread");
+
+  const result = task(ctx, ["--link-key", "impl", "--json", "first round"], { timeoutMs: 20000 });
+
+  assert.notEqual(result.error?.code, "ETIMEDOUT", "the idle limit never fired");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /No activity from Codex/);
+});
+
+test("a background worker does not run a job that is no longer queued", () => {
+  const ctx = setupRepo();
+  const request = { cwd: ctx.repo, prompt: "never run", write: false, resumeLast: false, linkKey: "impl", jobId: "task-cancelled" };
+  upsertJob(ctx.repo, { id: "task-cancelled", kind: "task", jobClass: "task", status: "cancelled", sessionId: "sess-a", linkKey: "impl" });
+  writeJobFile(ctx.repo, "task-cancelled", { id: "task-cancelled", kind: "task", jobClass: "task", status: "cancelled", phase: "cancelled", sessionId: "sess-a", linkKey: "impl", request });
+
+  const result = run("node", [SCRIPT, "task-worker", "--cwd", ctx.repo, "--job-id", "task-cancelled"], { cwd: ctx.repo, env: ctx.env() });
+
+  assert.equal(result.status, 0, result.stderr);
+  // No app-server was even started for it.
+  assert.equal(fs.existsSync(path.join(ctx.binDir, "fake-codex-state.json")), false);
+  assert.equal(readJobFile(resolveJobFile(ctx.repo, "task-cancelled")).status, "cancelled");
+  assert.equal(listJobs(ctx.repo).find((job) => job.id === "task-cancelled").status, "cancelled");
 });

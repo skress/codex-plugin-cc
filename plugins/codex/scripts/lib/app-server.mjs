@@ -487,6 +487,11 @@ export class CodexAppServerClient {
       : new SpawnedCodexAppServerClient(cwd, options);
     try {
       await client.initialize();
+      if (client.exitResolved) {
+        // The connection failed right after initialize (for example garbage in
+        // the same read): this client is unusable.
+        throw client.exitError ?? new Error("codex app-server connection closed during initialize.");
+      }
     } catch (error) {
       // The caller never gets this client, so stop its process or socket here.
       await client.close().catch(() => {});

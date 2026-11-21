@@ -205,6 +205,26 @@ export function failActiveJob(workspaceRoot, jobId, errorMessage, options = {}) 
   return true;
 }
 
+// Adds the start token of a queued job's worker, only while the job is still
+// queued with that pid (the worker may already have taken over).
+export function recordQueuedStartToken(workspaceRoot, jobId, pid) {
+  const pidStartToken = readProcessStartToken(pid);
+  if (!pidStartToken) {
+    return;
+  }
+  const state = loadState(workspaceRoot);
+  const current = state.jobs.find((job) => job.id === jobId);
+  if (!current || current.status !== "queued" || current.pid !== pid || current.pidStartToken) {
+    return;
+  }
+  current.pidStartToken = pidStartToken;
+  saveState(workspaceRoot, state);
+  const stored = readStoredJobOrNull(workspaceRoot, jobId);
+  if (stored && stored.status === "queued" && stored.pid === pid && !stored.pidStartToken) {
+    writeJobFile(workspaceRoot, jobId, { ...stored, pidStartToken });
+  }
+}
+
 // When a job's file already holds the run's outcome but the index still says
 // active (the run is between its two writes, or died there), the index takes the
 // file's outcome. Returns the file's status, or null when the file is not terminal.

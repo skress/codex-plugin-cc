@@ -53,6 +53,7 @@ import {
   createProgressReporter,
   adoptTerminalJobFile,
   nowIso,
+  recordQueuedStartToken,
   reconcileDeadJobs,
   runTrackedJob,
   SESSION_ID_ENV
@@ -733,14 +734,16 @@ function enqueueBackgroundTask(cwd, job, request) {
     ...job,
     status: "queued",
     phase: "queued",
-    // No start token here: reading it takes time while the worker already looks
-    // for this record. The worker records its own token when it starts running.
     pid: child.pid ?? null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+  // The record exists before the (slower) token lookup, so the worker finds it;
+  // the token then guards cancel and SessionEnd against pid reuse even if the
+  // worker dies before it records its own.
+  recordQueuedStartToken(job.workspaceRoot, job.id, child.pid ?? null);
 
   return {
     payload: {
@@ -908,6 +911,11 @@ async function handleTaskWorker(argv) {
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
+  }
+
+  if (storedJob.status !== "queued") {
+    // Cancelled (or otherwise settled) before this worker got to it.
+    return;
   }
 
   const request = storedJob.request;
