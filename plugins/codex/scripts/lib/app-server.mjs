@@ -148,6 +148,9 @@ class AppServerClientBase {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
     }
+    if (this.outputEnded || this.exitResolved) {
+      return Promise.reject(this.exitError ?? createProtocolError("codex app-server closed its output stream."));
+    }
 
     const id = this.nextId;
     this.nextId += 1;
@@ -324,6 +327,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       if (this.closed) {
         return;
       }
+      // Nothing can answer any more: connect() and new requests see this at once;
+      // pending requests fail shortly (after a crash's exit code had its chance).
+      this.outputEnded = true;
       // Give a crashing process a moment to report its exit code and stderr.
       setTimeout(() => {
         if (!this.closed) {
@@ -487,10 +493,13 @@ export class CodexAppServerClient {
       : new SpawnedCodexAppServerClient(cwd, options);
     try {
       await client.initialize();
-      if (client.exitResolved) {
+      // Let stream events queued with the initialize reply (an end of output, a
+      // parse failure) run before judging the connection healthy.
+      await new Promise((resolve) => setImmediate(resolve));
+      if (client.exitResolved || client.outputEnded) {
         // The connection failed right after initialize (for example garbage in
         // the same read): this client is unusable.
-        throw client.exitError ?? new Error("codex app-server connection closed during initialize.");
+        throw client.exitError ?? new Error("codex app-server closed its output stream during initialize.");
       }
     } catch (error) {
       // The caller never gets this client, so stop its process or socket here.

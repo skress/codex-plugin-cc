@@ -316,6 +316,12 @@ rl.on("line", (line) => {
         }
         state.capabilities = message.params.capabilities || null;
         saveState(state);
+        if (BEHAVIOR === "init-then-close-stdout" || (BEHAVIOR === "resume-hangs-eof-replacement" && START_INDEX === 2)) {
+          // Answers initialize and ends its output in the same callback, staying alive.
+          process.stdout.end(JSON.stringify({ id: message.id, result: { userAgent: "fake-codex-app-server" } }) + "\\n");
+          setInterval(() => {}, 1000);
+          break;
+        }
         if (BEHAVIOR === "resume-hangs-garbage-replacement" && START_INDEX === 2) {
           // The replacement answers initialize, then breaks its protocol stream in
           // the same write.
@@ -392,7 +398,10 @@ rl.on("line", (line) => {
           break;
         }
         // Withhold the reply: always, or only in the first app-server process that sees a resume.
-        if (BEHAVIOR === "resume-hangs" || (BEHAVIOR === "resume-hangs-garbage-replacement" && START_INDEX === 1)) {
+        if (
+          BEHAVIOR === "resume-hangs" ||
+          ((BEHAVIOR === "resume-hangs-garbage-replacement" || BEHAVIOR === "resume-hangs-eof-replacement") && START_INDEX === 1)
+        ) {
           break;
         }
         if (BEHAVIOR === "resume-hangs-once" && !state.resumeHangConsumed) {

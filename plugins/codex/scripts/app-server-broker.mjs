@@ -25,6 +25,7 @@ const UPSTREAM_CLOSE_TIMEOUT_MS = 2000;
 const SHUTDOWN_STEP_TIMEOUT_MS = 2000;
 // The client waits 20 s longer than the broker's request limit; answer before that.
 const RESTART_REPLY_LIMIT_MS = 15000;
+const RESTART_PROBE_TIMEOUT_MS = 5000;
 
 function withLimit(promise, timeoutMs) {
   let timer = null;
@@ -170,6 +171,15 @@ async function main() {
         await previous.close().catch(() => {});
         try {
           const replacement = await connectUpstream();
+          // A replacement counts as restarted only after it answered a real
+          // request: its output can end, or its process die, right after
+          // initialize, and the client would then retry against a dead one.
+          try {
+            await replacement.request("config/read", { includeLayers: false, cwd }, { timeoutMs: RESTART_PROBE_TIMEOUT_MS });
+          } catch (probeError) {
+            await replacement.close().catch(() => {});
+            throw probeError;
+          }
           if (shuttingDown) {
             // Shutdown began meanwhile: never leave a replacement running.
             await replacement.close().catch(() => {});

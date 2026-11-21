@@ -894,3 +894,46 @@ test("a background worker does not run a job that is no longer queued", () => {
   assert.equal(readJobFile(resolveJobFile(ctx.repo, "task-cancelled")).status, "cancelled");
   assert.equal(listJobs(ctx.repo).find((job) => job.id === "task-cancelled").status, "cancelled");
 });
+
+test("a replacement app-server that ends its output right after initialize is not reported as a restart", () => {
+  const ctx = setupRepo("resume-hangs-eof-replacement");
+  linkThread(ctx, "impl");
+
+  const result = task(ctx, ["--link-key", "impl", "--resume-last", "--json", "second round"], { timeoutMs: 30000 });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /did not answer thread\/resume/);
+  assert.doesNotMatch(result.stderr, /closed its output stream/);
+  // No retry on a replacement that never worked.
+  assert.equal(ctx.fakeState().resumeRequests, 1);
+});
+
+test("a job file is replaced atomically, so a concurrent reader never sees a partial record", async () => {
+  const ctx = setupRepo();
+  const jobFile = resolveJobFile(ctx.repo, "task-big");
+  const big = { id: "task-big", status: "queued", request: { prompt: "x".repeat(400 * 1024) } };
+  writeJobFile(ctx.repo, "task-big", big);
+  const reader = spawn("node", ["-e", `
+    const fs = require("node:fs");
+    const deadline = Date.now() + 3000;
+    let torn = 0;
+    while (Date.now() < deadline) {
+      try { JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch { torn += 1; }
+    }
+    process.stdout.write(String(torn));
+  `, jobFile], { stdio: ["ignore", "pipe", "ignore"] });
+  let output = "";
+  reader.stdout.on("data", (chunk) => {
+    output += chunk;
+  });
+  const done = new Promise((resolve) => reader.on("exit", resolve));
+  const deadline = Date.now() + 2500;
+  let writes = 0;
+  while (Date.now() < deadline) {
+    writeJobFile(ctx.repo, "task-big", { ...big, pidStartToken: `token-${writes}` });
+    writes += 1;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  await done;
+  assert.equal(Number(output), 0, `the reader saw ${output} partial records during ${writes} writes`);
+});

@@ -9,6 +9,7 @@ export function runCommand(command, args = [], options = {}) {
     encoding: "utf8",
     input: options.input,
     maxBuffer: options.maxBuffer,
+    timeout: options.timeout,
     stdio: options.stdio ?? "pipe",
     shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
     windowsHide: true
@@ -67,7 +68,9 @@ export function terminateProcessTree(pid, options = {}) {
   if (platform === "win32") {
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      env: options.env,
+      // Bounded: callers run this during teardown, some in an exit handler.
+      timeout: options.timeout ?? 5000
     });
 
     if (!result.error && result.status === 0) {
