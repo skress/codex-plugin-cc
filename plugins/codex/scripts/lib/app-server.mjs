@@ -11,7 +11,6 @@ import fs from "node:fs";
 import net from "node:net";
 import process from "node:process";
 import { spawn } from "node:child_process";
-import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
@@ -190,15 +189,29 @@ class AppServerClientBase {
     this.sendMessage({ method, params });
   }
 
+  // Messages are split on "\n" only. JSON strings may hold U+2028 and U+2029
+  // unescaped, and the app-server sends them that way; a reader that also ends
+  // lines there (node:readline does) cuts such a message in two.
+  // Only the new chunk is searched, so a large message arriving in many reads
+  // costs linear time.
   handleChunk(chunk) {
-    this.lineBuffer += chunk;
-    let newlineIndex = this.lineBuffer.indexOf("\n");
+    let start = 0;
+    let newlineIndex = chunk.indexOf("\n");
     while (newlineIndex !== -1) {
-      const line = this.lineBuffer.slice(0, newlineIndex);
-      this.lineBuffer = this.lineBuffer.slice(newlineIndex + 1);
+      const line = this.lineBuffer + chunk.slice(start, newlineIndex);
+      this.lineBuffer = "";
+      start = newlineIndex + 1;
       this.handleLine(line);
-      newlineIndex = this.lineBuffer.indexOf("\n");
+      newlineIndex = chunk.indexOf("\n", start);
     }
+    this.lineBuffer += chunk.slice(start);
+  }
+
+  // The stream ended: a last message without a line ending still counts.
+  flushLineBuffer() {
+    const line = this.lineBuffer;
+    this.lineBuffer = "";
+    this.handleLine(line);
   }
 
   handleLine(line) {
@@ -317,16 +330,18 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.handleExit(detail);
     });
 
-    this.readline = readline.createInterface({ input: this.proc.stdout });
-    this.readline.on("line", (line) => {
-      this.handleLine(line);
-    });
+    // stdout is decoded as UTF-8 (setEncoding above), so a character split
+    // across reads arrives whole.
+    this.onStdoutData = (chunk) => {
+      this.handleChunk(chunk);
+    };
     // The protocol stream ended: nothing can answer any more, even if the
     // process keeps running. close() still stops the process.
-    this.readline.on("close", () => {
+    this.onStdoutEnd = () => {
       if (this.closed) {
         return;
       }
+      this.flushLineBuffer();
       // Nothing can answer any more: connect() and new requests see this at once;
       // pending requests fail shortly (after a crash's exit code had its chance).
       this.outputEnded = true;
@@ -336,7 +351,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
           this.handleExit(createProtocolError("codex app-server closed its output stream."));
         }
       }, 200).unref?.();
-    });
+    };
+    this.proc.stdout.on("data", this.onStdoutData);
+    this.proc.stdout.on("end", this.onStdoutEnd);
 
     await this.request("initialize", {
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
@@ -353,8 +370,11 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
     this.closed = true;
 
-    if (this.readline) {
-      this.readline.close();
+    // Stop reading the protocol stream.
+    if (this.onStdoutData) {
+      this.proc.stdout.off("data", this.onStdoutData);
+      this.proc.stdout.off("end", this.onStdoutEnd);
+      this.proc.stdout.pause();
     }
 
     if (this.proc && !this.proc.killed) {
