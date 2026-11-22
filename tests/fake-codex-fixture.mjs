@@ -16,6 +16,9 @@ const readline = require("node:readline");
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
+// Text with U+2028 and U+2029, written as escapes so that no reader of this
+// file meets the raw characters.
+const SEPARATOR_TEXT = "line one\\u2028line two\\u2029line three";
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
@@ -249,6 +252,10 @@ function taskPayload(prompt, resume) {
     return "Resumed the prior run.\\nFollow-up prompt accepted.";
   }
 
+  if (BEHAVIOR === "line-separators") {
+    return "Handled the requested task.\\n" + SEPARATOR_TEXT;
+  }
+
   return "Handled the requested task.\\nTask prompt accepted.";
 }
 
@@ -382,6 +389,22 @@ rl.on("line", (line) => {
           threads = threads.filter((thread) => (thread.name || "").includes(message.params.searchTerm));
         }
         threads.sort((left, right) => right.updatedAt - left.updatedAt);
+        if (BEHAVIOR === "line-separators-split-write") {
+          // JSON.stringify leaves U+2028/U+2029 unescaped, as the real app-server
+          // does. The reply leaves in two writes that cut U+2028's UTF-8 bytes in
+          // half, with a CRLF line ending.
+          const bytes = Buffer.from(JSON.stringify({ id: message.id, result: { data: [], nextCursor: null, text: SEPARATOR_TEXT } }) + "\\r\\n", "utf8");
+          const cut = bytes.indexOf(Buffer.from("\\u2028", "utf8")) + 1;
+          process.stdout.write(bytes.subarray(0, cut));
+          setTimeout(() => process.stdout.write(bytes.subarray(cut)), 100);
+          break;
+        }
+        if (BEHAVIOR === "reply-without-newline-then-close") {
+          // The last reply has no line ending; the output stream ends right after it.
+          process.stdout.end(JSON.stringify({ id: message.id, result: { data: [], nextCursor: null } }));
+          setInterval(() => {}, 1000);
+          break;
+        }
         send({ id: message.id, result: { data: threads.map(buildThread), nextCursor: null } });
         break;
       }
